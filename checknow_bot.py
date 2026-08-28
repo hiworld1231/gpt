@@ -17,8 +17,7 @@ from linuxdo_hunter import (
 
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 CHAT_ID = str(os.environ["TG_CHAT_ID"])
-# IMPORTANT: StringSession means this command process does NOT create/open a SQLite .session file.
-# This completely removes the Telethon "database is locked" problem between services.
+# Separate in-memory Telegram session. No .session SQLite file is opened.
 TG_CHECKNOW_STRING_SESSION = os.getenv("TG_CHECKNOW_STRING_SESSION", "").strip()
 
 
@@ -32,11 +31,7 @@ def get_updates(offset=None):
 
 
 def reply(text):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
-        timeout=20,
-    ).raise_for_status()
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=20).raise_for_status()
 
 
 async def get_recent_messages(limit=15):
@@ -44,10 +39,7 @@ async def get_recent_messages(limit=15):
         raise RuntimeError("TG_API_ID/TG_API_HASH не настроены")
     if not TG_CHECKNOW_STRING_SESSION:
         raise RuntimeError("TG_CHECKNOW_STRING_SESSION не настроен")
-    # StringSession is in-memory only: no SQLite file and no DB lock.
-    client = TelegramClient(
-        StringSession(TG_CHECKNOW_STRING_SESSION), int(TG_API_ID), TG_API_HASH
-    )
+    client = TelegramClient(StringSession(TG_CHECKNOW_STRING_SESSION), int(TG_API_ID), TG_API_HASH)
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -63,17 +55,7 @@ async def get_recent_messages(limit=15):
 
 
 def call_model(model, prompt):
-    r = requests.post(
-        f"{LLM_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=120,
-    )
+    r = requests.post(f"{LLM_BASE}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}, json={"model": model, "temperature": 0.1, "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": prompt}]}, timeout=120)
     if r.status_code == 429:
         raise RuntimeError("RATE_LIMIT")
     r.raise_for_status()
@@ -94,9 +76,7 @@ def analyze_without_db(title, text, url):
     last_error = None
     for model in MODELS:
         try:
-            result = call_model(model, prompt)
-            result["score"] = int(result.get("score", 0))
-            return result
+            return call_model(model, prompt)
         except RuntimeError as e:
             last_error = str(e)
             if last_error == "RATE_LIMIT":
@@ -111,15 +91,13 @@ def format_result(result, url, original_url=""):
     tier = "S-TIER" if score >= 90 else "A-TIER"
     status = "🟢 подтверждено" if result.get("is_working") else "🟡 требует проверки"
     novelty = "🆕 новое" if result.get("is_new") else "♻️ уже известное"
-    msg = (
-        f"🔥 <b>{tier} — {score}/100</b> · {status} · {novelty}\n"
-        f"🏷 {html.escape(str(result.get('category', 'OTHER')))}\n\n"
-        f"💎 <b>{html.escape(str(result.get('summary', '')))}</b>\n\n"
-        f"💰 <b>Почему жирно:</b> {html.escape(str(result.get('why', '')))}\n"
-        f"🛠 <b>Как примерно повторить:</b> {html.escape(str(result.get('how', '')))}\n"
-        f"⚠️ <b>Риск/лимиты:</b> {html.escape(str(result.get('risk', '')))}\n\n"
-        f"🔗 {html.escape(url)}"
-    )
+    msg = (f"🔥 <b>{tier} — {score}/100</b> · {status} · {novelty}\n"
+           f"🏷 {html.escape(str(result.get('category', 'OTHER')))}\n\n"
+           f"💎 <b>{html.escape(str(result.get('summary', '')))}</b>\n\n"
+           f"💰 <b>Почему жирно:</b> {html.escape(str(result.get('why', '')))}\n"
+           f"🛠 <b>Как примерно повторить:</b> {html.escape(str(result.get('how', '')))}\n"
+           f"⚠️ <b>Риск/лимиты:</b> {html.escape(str(result.get('risk', '')))}\n\n"
+           f"🔗 {html.escape(url)}")
     if original_url and original_url != url:
         msg += f"\n🔎 <b>Оригинал:</b> {html.escape(original_url)}"
     return msg
@@ -127,7 +105,7 @@ def format_result(result, url, original_url=""):
 
 async def check_now():
     messages = await get_recent_messages(15)
-    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...\n💾 SQLite для Telethon не используется")
+    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...\n💾 SQLite-сессия Telethon НЕ используется")
     sent = 0
     for message in reversed(messages):
         text = (message.raw_text or "").strip()
@@ -149,16 +127,7 @@ def status():
     models = ", ".join(MODELS) if MODELS else "не настроены"
     key = "✅" if LLM_API_KEY else "❌"
     session = "✅ StringSession" if TG_CHECKNOW_STRING_SESSION else "❌ не настроена"
-    reply(
-        "🤖 <b>Linux.do Hunter</b>\n\n"
-        f"📡 Источник: @{TG_SOURCE_CHANNEL}\n"
-        f"🧠 Groq API: {key}\n"
-        f"🧠 Модели: <code>{html.escape(models)}</code>\n"
-        f"🎯 MIN_SCORE: {MIN_SCORE}\n"
-        f"🔐 Checknow session: {session}\n"
-        "💾 Checknow SQLite: НЕ используется\n"
-        "⚡ Команды: /checknow /status"
-    )
+    reply("🤖 <b>Linux.do Hunter</b>\n\n" f"📡 Источник: @{TG_SOURCE_CHANNEL}\n" f"🧠 Groq API: {key}\n" f"🧠 Модели: <code>{html.escape(models)}</code>\n" f"🎯 MIN_SCORE: {MIN_SCORE}\n" f"🔐 Checknow session: {session}\n" "💾 Checknow SQLite: НЕ используется\n" "⚡ Команды: /checknow /status")
 
 
 def main():
