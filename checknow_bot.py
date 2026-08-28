@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import html
+import json
 import os
 import time
 
@@ -8,7 +9,6 @@ import requests
 from telethon import TelegramClient
 
 from linuxdo_hunter import (
-    llm,
     telegram_url,
     telegram_title,
     TG_SOURCE_CHANNEL,
@@ -16,9 +16,12 @@ from linuxdo_hunter import (
     TG_API_HASH,
     TG_SESSION,
     LLM_API_KEY,
+    LLM_BASE,
+    MODELS,
     MIN_SCORE,
     extract_linuxdo_url,
     fetch_linuxdo_thread,
+    read_prompt,
 )
 
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
@@ -58,8 +61,26 @@ async def get_recent_messages(limit=15):
         await client.disconnect()
 
 
+def call_model(model, prompt):
+    r = requests.post(
+        f"{LLM_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
+    if r.status_code == 429:
+        raise RuntimeError("RATE_LIMIT")
+    r.raise_for_status()
+    return json.loads(r.json()["choices"][0]["message"]["content"])
+
+
 def analyze_without_db(title, text, url):
-    """Analyze a forced /checknow item without opening the shared SQLite DB."""
+    """Forced scan: deliberately uses NO SQLite at all."""
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY не настроен")
 
@@ -70,12 +91,27 @@ def analyze_without_db(title, text, url):
             title = original_title or title
             text = f"[Telegram-пост]\n{text}\n\n[ОРИГИНАЛЬНЫЙ LINUX.DO ТРЕД]\n{original_text}"
 
-    # llm() accepts con=None; it must not use SQLite when called this way.
-    result = llm(None, title, text, url)
-    score = int(result.get("score", 0))
-    if score < MIN_SCORE:
-        return False
+    base_prompt = read_prompt()
+    prompt = f"""{base_prompt}\n\nВерни СТРОГО JSON без markdown и без дополнительного текста. Обязательные поля: score (0-100), is_new (boolean), is_working (boolean), category (короткий UPPER_SNAKE_CASE), summary (до 300 символов, русский), why (до 220), how (до 500), risk (до 250).\n\nИсточник: {url}\nЗаголовок: {title}\n\nПОЛНЫЙ ДОСТУПНЫЙ МАТЕРИАЛ:\n{text[:50000]}"""
 
+    last_error = None
+    for model in MODELS:
+        try:
+            result = call_model(model, prompt)
+            result["score"] = int(result.get("score", 0))
+            return result
+        except RuntimeError as e:
+            last_error = str(e)
+            if last_error == "RATE_LIMIT":
+                print(f"checknow: model {model} rate limited, trying next", flush=True)
+                continue
+            raise
+
+    raise RuntimeError(f"all models unavailable: {last_error}")
+
+
+def format_result(result, url, original_url=""):
+    score = int(result.get("score", 0))
     tier = "S-TIER" if score >= 90 else "A-TIER"
     status = "🟢 подтверждено" if result.get("is_working") else "🟡 требует проверки"
     novelty = "🆕 новое" if result.get("is_new") else "♻️ уже известное"
@@ -90,20 +126,23 @@ def analyze_without_db(title, text, url):
     )
     if original_url and original_url != url:
         msg += f"\n🔎 <b>Оригинал:</b> {html.escape(original_url)}"
-    reply(msg)
-    return True
+    return msg
 
 
 async def check_now():
     messages = await get_recent_messages(15)
-    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...")
+    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...\n🗃 SQLite не используется")
     sent = 0
     for message in reversed(messages):
         text = (message.raw_text or "").strip()
         if not text:
             continue
+        url = telegram_url(message)
         try:
-            if await asyncio.to_thread(analyze_without_db, telegram_title(text), text[:50000], telegram_url(message)):
+            original_url = extract_linuxdo_url(text)
+            result = await asyncio.to_thread(analyze_without_db, telegram_title(text), text[:50000], url)
+            if int(result.get("score", 0)) >= MIN_SCORE:
+                reply(format_result(result, url, original_url))
                 sent += 1
         except Exception as e:
             print(f"check item {message.id}: {e}", flush=True)
@@ -111,7 +150,7 @@ async def check_now():
 
 
 def status():
-    models = os.getenv("LLM_MODELS", "") or os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+    models = ", ".join(MODELS) if MODELS else "не настроены"
     key = "✅" if LLM_API_KEY else "❌"
     reply(
         "🤖 <b>Linux.do Hunter</b>\n\n"
@@ -119,7 +158,7 @@ def status():
         f"🧠 Groq API: {key}\n"
         f"🧠 Модели: <code>{html.escape(models)}</code>\n"
         f"🎯 MIN_SCORE: {MIN_SCORE}\n"
-        "🗃 /checknow: отдельная БД не используется\n"
+        "🗃 /checknow: SQLite НЕ используется\n"
         "⚡ Команды: /checknow /status"
     )
 
