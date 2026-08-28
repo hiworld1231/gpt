@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import requests
+from curl_cffi import requests as cf_requests
 
 BASE = os.getenv("LINUXDO_URL", "https://linux.do").rstrip("/")
 TG_TOKEN = os.environ["TG_BOT_TOKEN"]
@@ -21,21 +22,12 @@ INTERVAL = int(os.getenv("INTERVAL_SECONDS", "3600"))
 DB = os.getenv("DB_PATH", "/var/lib/linuxdo-hunter/state.db")
 MIN_SCORE = int(os.getenv("MIN_SCORE", "70"))
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138 Safari/537.36 LinuxDO-Hunter/2.0",
-    "Accept": "application/json, text/html, */*",
+BROWSER_HEADERS = {
+    "Accept": "application/json, text/html, application/rss+xml, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
-
-KEYWORDS = {
-    "free": 8, "бесплат": 8, "халяв": 10, "free tier": 10,
-    "credit": 6, "credits": 6, "trial": 7, "student": 6, "promo": 6,
-    "quota": 8, "limit": 7, "лимит": 8, "reset": 7, "abuse": 10,
-    "bypass": 10, "обход": 10, "bug": 9, "уязв": 9, "api": 5,
-    "codex": 8, "claude": 8, "opus": 8, "gpt": 8, "gemini": 8,
-    "grok": 7, "kiro": 9, "sub2api": 10, "newapi": 9, "openrouter": 6,
-    "groq": 7, "oracle": 7, "vps": 7, "cloud": 6,
-}
-BAD = ["куплю", "продам", "продажа аккаунт", "ищу аккаунт", "рефералка", "новости дня"]
 
 
 def db_init():
@@ -62,41 +54,64 @@ def clean_html(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def linuxdo_get(path, accept=None):
+    """Use Chrome TLS fingerprint; optionally add Discourse API credentials."""
+    headers = dict(BROWSER_HEADERS)
+    if accept:
+        headers["Accept"] = accept
+    api_key = os.getenv("LINUXDO_API_KEY", "")
+    api_user = os.getenv("LINUXDO_API_USERNAME", "")
+    if api_key:
+        headers["Api-Key"] = api_key
+        if api_user:
+            headers["Api-Username"] = api_user
+    return cf_requests.get(
+        f"{BASE}{path}",
+        headers=headers,
+        impersonate="chrome",
+        timeout=30,
+        allow_redirects=True,
+    )
+
+
+def parse_rss(content):
+    root = ET.fromstring(content)
+    topics = []
+    for item in root.findall(".//item"):
+        title = item.findtext("title") or ""
+        link = item.findtext("link") or ""
+        m = re.search(r"/t/(?:[^/]+/)?(\d+)", link)
+        if not m:
+            continue
+        topics.append({
+            "id": int(m.group(1)),
+            "slug": link.split("/t/")[-1].rsplit("/", 1)[0],
+            "title": clean_html(title),
+            "url": link,
+        })
+    return topics
+
+
 def fetch_latest():
     errors = []
 
-    # RSS is usually less restricted than the Discourse JSON endpoint.
-    try:
-        r = requests.get(f"{BASE}/latest.rss", headers={
-            "User-Agent": HEADERS["User-Agent"],
-            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-        }, timeout=30)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        topics = []
-        for item in root.findall(".//item"):
-            title = item.findtext("title") or ""
-            link = item.findtext("link") or ""
-            m = re.search(r"/t/(?:[^/]+/)?(\d+)", link)
-            if not m:
-                continue
-            topics.append({
-                "id": int(m.group(1)),
-                "slug": link.split("/t/")[-1].rsplit("/", 1)[0],
-                "title": clean_html(title),
-                "url": link,
-            })
-        if topics:
-            return topics
-    except Exception as e:
-        errors.append(f"RSS: {e}")
-
-    # JSON fallbacks.
-    for path in ("/latest.json", "/latest.json?order=created"):
+    # Prefer the normal Discourse endpoint with a real Chrome TLS fingerprint.
+    for path in ("/latest.json?order=created", "/latest.json"):
         try:
-            r = requests.get(f"{BASE}{path}", headers=HEADERS, timeout=30)
+            r = linuxdo_get(path, "application/json, text/plain, */*")
             r.raise_for_status()
             topics = r.json().get("topic_list", {}).get("topics", [])
+            if topics:
+                return topics
+        except Exception as e:
+            errors.append(f"{path}: {e}")
+
+    # RSS fallback.
+    for path in ("/latest.rss", "/top.rss?period=daily"):
+        try:
+            r = linuxdo_get(path, "application/rss+xml, application/xml, text/xml, */*")
+            r.raise_for_status()
+            topics = parse_rss(r.content)
             if topics:
                 return topics
         except Exception as e:
@@ -106,19 +121,20 @@ def fetch_latest():
 
 
 def topic_text(topic_id):
-    r = requests.get(f"{BASE}/t/{topic_id}.json", headers=HEADERS, timeout=30)
+    r = linuxdo_get(f"/t/{topic_id}.json", "application/json, text/plain, */*")
     r.raise_for_status()
     data = r.json()
     posts = data.get("post_stream", {}).get("posts", [])
-    text = "\n\n".join(clean_html(p.get("cooked", "")) for p in posts[:8])
-    return data.get("title", ""), text[:16000]
-
-
-def heuristic(title, text):
-    s = (title + " " + text).lower()
-    score = sum(v for k, v in KEYWORDS.items() if k in s)
-    score -= sum(20 for k in BAD if k in s)
-    return max(0, min(100, score))
+    parts = []
+    for i, p in enumerate(posts, 1):
+        author = p.get("username") or "unknown"
+        body = clean_html(p.get("cooked", ""))
+        if body:
+            parts.append(f"[Комментарий {i} — {author}]\n{body}")
+    # Keep a large but bounded payload. The LLM sees the article and comments,
+    # not a keyword-selected fragment.
+    text = "\n\n".join(parts)
+    return data.get("title", ""), text[:30000]
 
 
 def model_available(con, model):
@@ -139,7 +155,7 @@ def call_model(model, prompt):
         "temperature": 0.1,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": prompt}],
-    }, timeout=90)
+    }, timeout=120)
     if r.status_code == 429:
         raise RuntimeError("RATE_LIMIT")
     r.raise_for_status()
@@ -148,19 +164,46 @@ def call_model(model, prompt):
 
 def llm(con, title, text):
     if not LLM_API_KEY:
-        return {"score": heuristic(title, text), "why": "LLM не настроена", "summary": title, "how": "Открой пост и проверь детали.", "risk": "Проверить вручную."}
+        return {"score": 0, "why": "LLM не настроена", "summary": title, "how": "", "risk": ""}
 
-    prompt = f'''Ты — охотник за самыми жирными находками на Linux.do. Ищи НЕ новости и НЕ обычные обсуждения.
+    prompt = f'''Ты — автономный охотник за САМЫМИ ЖИРНЫМИ находками на Linux.do.
 
-Приоритет: бесплатные AI API, кредиты, большие лимиты, free-tier, GPT/Claude/Gemini/Grok/Codex/Kiro, Sub2API/NewAPI, VPS/cloud credits, баги квот, необычные workaround и серые схемы с реальной практической выгодой.
+ВАЖНО: ниже передан ПОЛНЫЙ ДОСТУПНЫЙ ТЕКСТ темы вместе с комментариями. НЕ используй keyword-фильтр и НЕ предполагай заранее, о чём тема. Сам прочитай материал и реши, есть ли там что-то ценное.
 
-Верни СТРОГО JSON: {{"score":0,"summary":"","why":"","how":"","risk":""}}.
-90-100 = ебануто жирная находка; 70-89 = реально полезная; <70 = не отправлять.
-Не придумывай детали. Если автор только спрашивает/теоретизирует без результата — низкий score. Если схема требует чужих украденных ключей/аккаунтов — score <= 60.
-summary <= 240 символов; why <= 180; how <= 400; risk <= 200.
+Ищи прежде всего:
+- бесплатный или почти бесплатный доступ к сильным AI-моделям;
+- бесплатные API, кредиты, trial, подписки, student/free-tier;
+- огромные или необычные лимиты/квоты;
+- баги тарификации, reset лимитов и необычные loophole;
+- Sub2API, New API, CPA, gateway, Kiro, Codex, Claude, GPT, Gemini, Groq и любые новые аналоги;
+- бесплатные VPS/cloud/credits;
+- новые рабочие workaround и серые схемы;
+- неожиданные способы получить ресурс за $0 или сильно дешевле.
 
-ЗАГОЛОВОК: {title}
-ТЕКСТ: {text}'''
+Тема может быть на китайском, английском или русском. Понимай и переводь её сам.
+
+Не считай ценным обычную новость, релиз модели, просьбу о помощи или теоретическое обсуждение без практического результата.
+
+Верни СТРОГО JSON:
+{{
+  "score": 0,
+  "summary": "кратко по-русски, что нашли",
+  "why": "почему это реально жирно",
+  "how": "что делать пользователю примерно по шагам",
+  "risk": "лимиты, бан, условия и т.п."
+}}
+
+90-100 = очень редкая/жирная находка, которую стоит проверить сразу.
+70-89 = реально полезная находка.
+<70 = не отправлять.
+Не выдумывай отсутствующие в тексте детали. Если способ требует украденных чужих ключей/аккаунтов или чужого доступа — score <= 60.
+summary <= 300 символов; why <= 220; how <= 500; risk <= 250.
+
+ЗАГОЛОВОК:
+{title}
+
+ПОЛНЫЙ ТЕКСТ ТЕМЫ И КОММЕНТАРИЕВ:
+{text}'''
 
     last_error = None
     for model in MODELS:
@@ -201,9 +244,6 @@ def process(con):
             continue
         try:
             title, text = topic_text(tid)
-            if heuristic(title, text) < 5:
-                mark_seen(con, url)
-                continue
             result = llm(con, title, text)
             score = int(result.get("score", 0))
             if score >= MIN_SCORE:
@@ -225,7 +265,7 @@ def process(con):
 
 def main():
     con = db_init()
-    tg("🟢 <b>Linux.do Hunter запущен</b>\n\nИщу только жирные находки: халява, AI API, кредиты, лимиты, free-tier, workaround и серые схемы.")
+    tg("🟢 <b>Linux.do Hunter v3 запущен</b>\n\nТеперь LLM сама читает тему и комментарии целиком — без keyword-фильтра.")
     while True:
         try:
             process(con)
