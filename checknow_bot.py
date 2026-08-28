@@ -26,9 +26,12 @@ CHAT_ID = str(os.environ["TG_CHAT_ID"])
 
 
 def open_db():
-    con = sqlite3.connect(DB, timeout=30, check_same_thread=False)
-    con.execute("PRAGMA busy_timeout=30000")
-    con.execute("PRAGMA journal_mode=WAL")
+    # IMPORTANT: do not execute PRAGMA journal_mode=WAL here.
+    # Changing the journal mode requires an exclusive SQLite lock and
+    # races with the main Hunter process. This was the source of the
+    # /checknow "database is locked" error.
+    con = sqlite3.connect(DB, timeout=60, check_same_thread=False)
+    con.execute("PRAGMA busy_timeout=60000")
     con.execute("PRAGMA synchronous=NORMAL")
     return con
 
