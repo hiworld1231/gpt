@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
+import asyncio
 import html
 import json
 import os
 import re
 import sqlite3
 import time
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import requests
@@ -31,6 +31,7 @@ TG_SOURCE_CHANNEL = os.getenv("TG_SOURCE_CHANNEL", "linuxdoit").lstrip("@")
 TG_API_ID = os.getenv("TG_API_ID", "")
 TG_API_HASH = os.getenv("TG_API_HASH", "")
 TG_SESSION = os.getenv("TG_SESSION", "/var/lib/linuxdo-hunter/linuxdo_hunter")
+PROMPT_FILE = os.getenv("PROMPT_FILE", os.path.join(os.path.dirname(__file__), "prompt.txt"))
 
 BROWSER_HEADERS = {
     "Accept": "application/json, text/html, application/rss+xml, */*",
@@ -42,17 +43,20 @@ BROWSER_HEADERS = {
 
 def db_init():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, check_same_thread=False)
     con.execute("create table if not exists seen (id integer primary key, url text unique, created text)")
     con.execute("create table if not exists model_cooldown (model text primary key, until_ts real)")
+    con.execute("create table if not exists meta (key text primary key, value text)")
     con.commit()
     return con
 
 
 def tg(text):
-    r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", json={
-        "chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False
-    }, timeout=20)
+    r = requests.post(
+        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+        json={"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": False},
+        timeout=20,
+    )
     r.raise_for_status()
 
 
@@ -77,35 +81,74 @@ def linuxdo_get(path, accept=None):
     return cf_requests.get(f"{BASE}{path}", headers=headers, impersonate="chrome", timeout=30, allow_redirects=True)
 
 
+def extract_linuxdo_url(text):
+    m = re.search(r"https?://(?:www\.)?linux\.do/t/[^\s)<>]+", text, re.I)
+    if not m:
+        return ""
+    return m.group(0).rstrip(".,!?;:，。！？；：")
+
+
+def linuxdo_topic_from_url(url):
+    m = re.search(r"/t/[^/]+/(\d+)", url)
+    return int(m.group(1)) if m else None
+
+
+def fetch_linuxdo_thread(url):
+    tid = linuxdo_topic_from_url(url)
+    if not tid:
+        return "", ""
+    try:
+        r = linuxdo_get(f"/t/{tid}.json", "application/json, text/plain, */*")
+        r.raise_for_status()
+        data = r.json()
+        posts = data.get("post_stream", {}).get("posts", [])
+        parts = []
+        for i, p in enumerate(posts, 1):
+            author = p.get("username") or "unknown"
+            body = clean_html(p.get("cooked", ""))
+            if body:
+                parts.append(f"[Комментарий {i} — {author}]\n{body}")
+        return data.get("title", ""), "\n\n".join(parts)[:40000]
+    except Exception as e:
+        print(f"original Linux.do thread unavailable: {e}", flush=True)
+        return "", ""
+
+
+def read_prompt():
+    try:
+        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+            prompt = f.read().strip()
+        if prompt:
+            return prompt
+    except Exception as e:
+        print(f"prompt file unavailable: {e}", flush=True)
+    return """Ты анализируешь посты Linux.do и Telegram как охотник за редкими практическими находками. Определи, есть ли реально работающий и полезный способ получить что-то бесплатно или сильно дешевле. Не выдумывай. Верни JSON с score, is_new, is_working, category, summary, why, how, risk."""
+
+
 def parse_rss(content):
+    import xml.etree.ElementTree as ET
     root = ET.fromstring(content)
     topics = []
     for item in root.findall(".//item"):
         title = item.findtext("title") or ""
         link = item.findtext("link") or ""
         m = re.search(r"/t/(?:[^/]+/)?(\d+)", link)
-        if not m:
-            continue
-        topics.append({"id": int(m.group(1)), "slug": link.split("/t/")[-1].rsplit("/", 1)[0], "title": clean_html(title), "url": link})
+        if m:
+            topics.append({"id": int(m.group(1)), "slug": link.split("/t/")[-1].rsplit("/", 1)[0], "title": clean_html(title), "url": link})
     return topics
 
 
 def fetch_latest():
     errors = []
-    for path in ("/latest.json?order=created", "/latest.json"):
+    for path in ("/latest.json?order=created", "/latest.json", "/latest.rss", "/top.rss?period=daily"):
         try:
-            r = linuxdo_get(path, "application/json, text/plain, */*")
+            accept = "application/rss+xml, application/xml, text/xml, */*" if path.endswith("rss") or ".rss?" in path else "application/json, text/plain, */*"
+            r = linuxdo_get(path, accept)
             r.raise_for_status()
-            topics = r.json().get("topic_list", {}).get("topics", [])
-            if topics:
-                return topics
-        except Exception as e:
-            errors.append(f"{path}: {e}")
-    for path in ("/latest.rss", "/top.rss?period=daily"):
-        try:
-            r = linuxdo_get(path, "application/rss+xml, application/xml, text/xml, */*")
-            r.raise_for_status()
-            topics = parse_rss(r.content)
+            if "rss" in path:
+                topics = parse_rss(r.content)
+            else:
+                topics = r.json().get("topic_list", {}).get("topics", [])
             if topics:
                 return topics
         except Exception as e:
@@ -120,11 +163,10 @@ def topic_text(topic_id):
     posts = data.get("post_stream", {}).get("posts", [])
     parts = []
     for i, p in enumerate(posts, 1):
-        author = p.get("username") or "unknown"
         body = clean_html(p.get("cooked", ""))
         if body:
-            parts.append(f"[Комментарий {i} — {author}]\n{body}")
-    return data.get("title", ""), "\n\n".join(parts)[:30000]
+            parts.append(f"[Комментарий {i} — {p.get('username') or 'unknown'}]\n{body}")
+    return data.get("title", ""), "\n\n".join(parts)[:40000]
 
 
 def model_available(con, model):
@@ -133,14 +175,25 @@ def model_available(con, model):
 
 
 def cooldown_model(con, model, seconds=300):
-    con.execute("insert into model_cooldown(model, until_ts) values (?, ?) on conflict(model) do update set until_ts=excluded.until_ts", (model, time.time() + seconds))
+    con.execute(
+        "insert into model_cooldown(model, until_ts) values (?, ?) on conflict(model) do update set until_ts=excluded.until_ts",
+        (model, time.time() + seconds),
+    )
     con.commit()
 
 
 def call_model(model, prompt):
-    r = requests.post(f"{LLM_BASE}/chat/completions", headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}, json={
-        "model": model, "temperature": 0.1, "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": prompt}]
-    }, timeout=120)
+    r = requests.post(
+        f"{LLM_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": model,
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=120,
+    )
     if r.status_code == 429:
         raise RuntimeError("RATE_LIMIT")
     r.raise_for_status()
@@ -149,30 +202,11 @@ def call_model(model, prompt):
 
 def llm(con, title, text, source_url=""):
     if not LLM_API_KEY:
-        return {"score": 0, "why": "LLM не настроена", "summary": title, "how": "", "risk": ""}
-    prompt = f'''Ты — автономный охотник за САМЫМИ ЖИРНЫМИ находками.
+        return {"score": 0, "is_new": False, "is_working": False, "category": "OTHER", "why": "LLM не настроена", "summary": title, "how": "", "risk": ""}
 
-Ниже передан ПОЛНЫЙ ДОСТУПНЫЙ ТЕКСТ поста/темы и комментариев. НЕ используй keyword-фильтр. Сам прочитай материал и реши, есть ли там практическая ценность.
+    base_prompt = read_prompt()
+    prompt = f"""{base_prompt}\n\nВерни СТРОГО JSON без markdown и без дополнительного текста. Обязательные поля: score (0-100), is_new (boolean), is_working (boolean), category (короткий UPPER_SNAKE_CASE), summary (до 300 символов, русский), why (до 220), how (до 500), risk (до 250).\n\nИсточник: {source_url}\nЗаголовок: {title}\n\nПОЛНЫЙ ДОСТУПНЫЙ МАТЕРИАЛ:\n{text[:50000]}"""
 
-Ищи прежде всего бесплатный/почти бесплатный доступ к сильным AI-моделям, API/credits/free-tier/trial, огромные лимиты, loophole/reset квот, Sub2API/New API/CPA/gateway, Kiro/Codex/Claude/GPT/Gemini/Groq, бесплатные VPS/cloud/credits, новые workaround и серые схемы, а также любые неожиданные способы получить ресурс за $0 или сильно дешевле.
-
-Материал может быть на китайском, английском или русском. Переводи и объясняй по-русски.
-
-Не считай ценным обычную новость, релиз, вопрос или теорию без практического результата. Не выдумывай детали. Если способ требует украденных чужих ключей/аккаунтов или чужого доступа — score <= 60.
-
-Верни СТРОГО JSON:
-{{"score":0,"summary":"кратко по-русски","why":"почему жирно","how":"примерные шаги","risk":"лимиты/риск"}}
-
-90-100 = очень редкая/жирная находка, проверить сразу.
-70-89 = реально полезная находка.
-<70 = не отправлять.
-summary <= 300 символов; why <= 220; how <= 500; risk <= 250.
-
-ИСТОЧНИК: {source_url}
-ЗАГОЛОВОК: {title}
-
-ПОЛНЫЙ ТЕКСТ:
-{text}'''
     last_error = None
     for model in MODELS:
         if not model_available(con, model):
@@ -204,18 +238,31 @@ def send_result(con, title, text, url):
     if already_seen(con, url):
         return
     try:
+        original_url = extract_linuxdo_url(text)
+        original_title, original_text = ("", "")
+        if original_url:
+            original_title, original_text = fetch_linuxdo_thread(original_url)
+        if original_text:
+            title = original_title or title
+            text = f"[Telegram-пост]\n{text}\n\n[ОРИГИНАЛЬНЫЙ LINUX.DO ТРЕД]\n{original_text}"
+
         result = llm(con, title, text, url)
         score = int(result.get("score", 0))
         if score >= MIN_SCORE:
             tier = "S-TIER" if score >= 90 else "A-TIER"
+            status = "🟢 подтверждено" if result.get("is_working") else "🟡 требует проверки"
+            novelty = "🆕 новое" if result.get("is_new") else "♻️ уже известное"
             msg = (
-                f"🔥 <b>{tier} — {score}/100</b>\n\n"
+                f"🔥 <b>{tier} — {score}/100</b> · {status} · {novelty}\n"
+                f"🏷 {html.escape(str(result.get('category', 'OTHER')))}\n\n"
                 f"💎 <b>{html.escape(str(result.get('summary', '')))}</b>\n\n"
                 f"💰 <b>Почему жирно:</b> {html.escape(str(result.get('why', '')))}\n"
                 f"🛠 <b>Как примерно повторить:</b> {html.escape(str(result.get('how', '')))}\n"
                 f"⚠️ <b>Риск/лимиты:</b> {html.escape(str(result.get('risk', '')))}\n\n"
                 f"🔗 {html.escape(url)}"
             )
+            if original_url and original_url != url:
+                msg += f"\n🔎 <b>Оригинал:</b> {html.escape(original_url)}"
             tg(msg)
             print(f"SENT {score}: {title}", flush=True)
         mark_seen(con, url)
@@ -240,27 +287,18 @@ def process_linuxdo(con):
             print(f"linuxdo topic {tid}: {e}", flush=True)
 
 
-def telegram_text(message):
-    text = message.raw_text or ""
-    if not text and getattr(message, "message", None):
-        text = str(message.message)
-    return text.strip()
-
-
 def telegram_url(message):
     return f"https://t.me/{TG_SOURCE_CHANNEL}/{message.id}"
 
 
 def telegram_title(text):
     lines = [x.strip() for x in text.splitlines() if x.strip()]
-    if not lines:
-        return f"Telegram post {datetime.now(timezone.utc).isoformat()}"
-    return lines[0][:300]
+    return (lines[0] if lines else "Telegram post")[:300]
 
 
 async def run_telegram(con):
     if not TelegramClient:
-        raise RuntimeError("Telethon не установлен: pip install telethon")
+        raise RuntimeError("Telethon не установлен")
     if not TG_API_ID or not TG_API_HASH:
         raise RuntimeError("TG_API_ID/TG_API_HASH не настроены")
 
@@ -268,9 +306,7 @@ async def run_telegram(con):
     await client.start()
     entity = await client.get_entity(TG_SOURCE_CHANNEL)
 
-    # On first run, don't flood Telegram with the whole history. Seed the last 10 posts as seen.
     seed_key = f"tg_seed_{TG_SOURCE_CHANNEL}"
-    con.execute("create table if not exists meta (key text primary key, value text)")
     seeded = con.execute("select 1 from meta where key=?", (seed_key,)).fetchone()
     if not seeded:
         async for message in client.iter_messages(entity, limit=10):
@@ -282,14 +318,10 @@ async def run_telegram(con):
     @client.on(events.NewMessage(chats=entity))
     async def handler(event):
         message = event.message
-        text = telegram_text(message)
+        text = (message.raw_text or "").strip()
         if not text:
             return
-        url = telegram_url(message)
-        title = telegram_title(text)
-        # Run blocking LLM/network work off the event loop.
-        import asyncio
-        await asyncio.to_thread(send_result, con, title, text[:30000], url)
+        await asyncio.to_thread(send_result, con, telegram_title(text), text[:50000], telegram_url(message))
 
     print(f"Telegram listener active: @{TG_SOURCE_CHANNEL}", flush=True)
     await client.run_until_disconnected()
@@ -297,18 +329,15 @@ async def run_telegram(con):
 
 def main():
     con = db_init()
-    tg("🟢 <b>Linux.do Hunter v4 запущен</b>\n\nИсточник: Telegram @" + html.escape(TG_SOURCE_CHANNEL) + "\nLLM читает посты целиком, без keyword-фильтра.")
+    tg("🟢 <b>Linux.do Hunter v5 запущен</b>\n\nИсточник: Telegram @" + html.escape(TG_SOURCE_CHANNEL) + "\nПромпт читается из prompt.txt перед каждым анализом.")
 
-    # Telegram is the primary real-time source. Linux.do HTTP remains an optional fallback.
     if TG_API_ID and TG_API_HASH and TelegramClient:
-        import asyncio
         try:
             asyncio.run(run_telegram(con))
             return
         except Exception as e:
             print(f"telegram listener stopped: {e}", flush=True)
 
-    # Fallback to the old hourly Linux.do polling when Telegram isn't configured.
     while True:
         try:
             process_linuxdo(con)
