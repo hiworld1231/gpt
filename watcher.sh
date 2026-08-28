@@ -5,7 +5,6 @@ APP_DIR="${APP_DIR:-/opt/linuxdo-hunter}"
 BRANCH="${BRANCH:-main}"
 INTERVAL="${WATCH_INTERVAL:-45}"
 LOCK="/var/run/linuxdo-hunter-watcher.lock"
-ENV_FILE="/etc/linuxdo-hunter.env"
 SERVICES=("linuxdo-hunter.service" "linuxdo-hunter-checknow.service")
 
 exec 9>"$LOCK"
@@ -13,70 +12,64 @@ flock -n 9 || exit 0
 
 cd "$APP_DIR" || exit 1
 
-if [ -f "$ENV_FILE" ]; then
+notify() {
+    [ -f /etc/linuxdo-hunter.env ] || return 0
     set -a
-    source "$ENV_FILE"
+    # shellcheck disable=SC1091
+    . /etc/linuxdo-hunter.env
     set +a
-fi
-
-notify_telegram() {
+    [ -n "${TG_BOT_TOKEN:-}" ] || return 0
+    [ -n "${TG_CHAT_ID:-}" ] || return 0
     local text="$1"
-    if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
-        return 0
-    fi
     curl -fsS --max-time 15 \
         -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${TG_CHAT_ID}" \
-        --data-urlencode "text=${text}" \
-        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1 || true
+        -d "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${text}" >/dev/null 2>&1 || true
 }
 
 update_repo() {
     if ! git fetch origin "$BRANCH" --quiet; then
         echo "[$(date -Is)] git fetch failed"
+        notify "❌ Linux.do Hunter: не удалось получить обновления из GitHub."
         return 1
     fi
 
     LOCAL_SHA="$(git rev-parse HEAD 2>/dev/null || echo none)"
     REMOTE_SHA="$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo none)"
 
-    if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
-        return 0
-    fi
+    [ "$LOCAL_SHA" = "$REMOTE_SHA" ] && return 0
 
-    OLD_VERSION="$(cat version.txt 2>/dev/null || echo unknown)"
-    echo "[$(date -Is)] update $LOCAL_SHA -> $REMOTE_SHA"
+    REMOTE_VERSION="$(git show "origin/$BRANCH:version.txt" 2>/dev/null || echo '?')"
+    LOCAL_VERSION="$(git show HEAD:version.txt 2>/dev/null || echo '?')"
+    echo "[$(date -Is)] update $LOCAL_SHA -> $REMOTE_SHA (v$LOCAL_VERSION -> v$REMOTE_VERSION)"
 
-    PROMPT_BACKUP=""
-    if [ -f prompt.txt ]; then
-        PROMPT_BACKUP="$(mktemp)"
-        cp -f prompt.txt "$PROMPT_BACKUP"
-    fi
-
-    git reset --hard "origin/$BRANCH" >/dev/null
-    git clean -fd >/dev/null
-
-    if [ -n "$PROMPT_BACKUP" ] && [ -f "$PROMPT_BACKUP" ]; then
-        cp -f "$PROMPT_BACKUP" prompt.txt
-        rm -f "$PROMPT_BACKUP"
-    fi
-
-    if [ -f requirements.txt ]; then
-        .venv/bin/pip install -q -r requirements.txt || echo "[$(date -Is)] pip install had errors"
-    fi
-
-    systemctl daemon-reload || true
-
-    if ! systemctl restart "${SERVICES[@]}"; then
-        notify_telegram "❌ <b>Linux.do Hunter: update error</b>%0A%0A📦 Версия: $OLD_VERSION → $(cat version.txt 2>/dev/null || echo '?')%0A🔧 Не удалось полностью перезапустить сервисы."
-        echo "[$(date -Is)] service restart failed"
+    # GitHub is the source of truth, including prompt.txt.
+    # Local tracked changes are intentionally discarded so the VPS always matches main.
+    if ! git reset --hard "origin/$BRANCH" >/dev/null; then
+        echo "[$(date -Is)] git reset failed"
+        notify "❌ Linux.do Hunter: GitHub обновление не применилось (v$REMOTE_VERSION)."
         return 1
     fi
 
-    NEW_VERSION="$(cat version.txt 2>/dev/null || echo unknown)"
-    SHORT_SHA="${REMOTE_SHA:0:7}"
-    notify_telegram "✅ <b>Linux.do Hunter обновлён</b>%0A%0A📦 Версия: <b>$OLD_VERSION → $NEW_VERSION</b>%0A🔨 Commit: <code>$SHORT_SHA</code>%0A🔄 Перезапущены: hunter + checknow%0A📝 prompt.txt сохранён.%0A🔗 https://github.com/hiworld1231/gpt/commit/${REMOTE_SHA}"
+    git clean -fd >/dev/null 2>&1 || true
+
+    if [ -f requirements.txt ]; then
+        if ! .venv/bin/pip install -q -r requirements.txt; then
+            echo "[$(date -Is)] pip install failed"
+            notify "⚠️ Linux.do Hunter: код v$REMOTE_VERSION обновлён, но установка зависимостей завершилась ошибкой."
+            return 1
+        fi
+    fi
+
+    systemctl daemon-reload || true
+    if ! systemctl restart "${SERVICES[@]}"; then
+        echo "[$(date -Is)] service restart failed"
+        notify "⚠️ Linux.do Hunter: v$REMOTE_VERSION загружена, но перезапуск сервисов завершился ошибкой."
+        return 1
+    fi
+
     echo "[$(date -Is)] hunter services restarted"
+    notify "✅ Linux.do Hunter обновлён\n\n📦 Версия: $LOCAL_VERSION → $REMOTE_VERSION\n🔄 Перезапущены: hunter + checknow\n📝 prompt.txt взят из GitHub\n🔨 ${REMOTE_SHA:0:12}"
     return 0
 }
 
