@@ -14,7 +14,6 @@ from linuxdo_hunter import (
     TG_SOURCE_CHANNEL,
     TG_API_ID,
     TG_API_HASH,
-    TG_SESSION,
     LLM_API_KEY,
     LLM_BASE,
     MODELS,
@@ -26,6 +25,12 @@ from linuxdo_hunter import (
 
 BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
 CHAT_ID = str(os.environ["TG_CHAT_ID"])
+# IMPORTANT: never share the same Telethon .session file with the main listener.
+# Two Telethon clients opening the same SQLite session causes "database is locked".
+TG_CHECKNOW_SESSION = os.getenv(
+    "TG_CHECKNOW_SESSION",
+    "/var/lib/linuxdo-hunter/linuxdo_hunter_checknow",
+)
 
 
 def get_updates(offset=None):
@@ -48,7 +53,7 @@ def reply(text):
 async def get_recent_messages(limit=15):
     if not TG_API_ID or not TG_API_HASH:
         raise RuntimeError("TG_API_ID/TG_API_HASH не настроены")
-    client = TelegramClient(TG_SESSION, int(TG_API_ID), TG_API_HASH)
+    client = TelegramClient(TG_CHECKNOW_SESSION, int(TG_API_ID), TG_API_HASH)
     await client.start()
     try:
         entity = await client.get_entity(TG_SOURCE_CHANNEL)
@@ -80,7 +85,7 @@ def call_model(model, prompt):
 
 
 def analyze_without_db(title, text, url):
-    """Forced scan: deliberately uses NO SQLite at all."""
+    """Forced scan: deliberately uses NO Hunter SQLite database."""
     if not LLM_API_KEY:
         raise RuntimeError("LLM_API_KEY не настроен")
 
@@ -131,7 +136,7 @@ def format_result(result, url, original_url=""):
 
 async def check_now():
     messages = await get_recent_messages(15)
-    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...\n🗃 SQLite не используется")
+    reply(f"🔎 Проверяю последние {len(messages)} постов @{TG_SOURCE_CHANNEL}...\n🗃 Hunter SQLite не используется")
     sent = 0
     for message in reversed(messages):
         text = (message.raw_text or "").strip()
@@ -158,7 +163,7 @@ def status():
         f"🧠 Groq API: {key}\n"
         f"🧠 Модели: <code>{html.escape(models)}</code>\n"
         f"🎯 MIN_SCORE: {MIN_SCORE}\n"
-        "🗃 /checknow: SQLite НЕ используется\n"
+        "🗃 /checknow: Hunter SQLite НЕ используется\n"
         "⚡ Команды: /checknow /status"
     )
 
