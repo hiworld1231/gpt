@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/linuxdo-hunter
-ExecStart=/opt/linuxdo-hunter/watcher.sh
+ExecStart=/bin/bash /opt/linuxdo-hunter/watcher.sh
 Restart=always
 RestartSec=10
 
