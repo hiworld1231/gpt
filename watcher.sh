@@ -30,7 +30,6 @@ install_unit() {
 }
 
 install_service_units() {
-    # Keep systemd definitions synchronized with GitHub on every watcher start/update.
     install_unit "$APP_DIR/linuxdo-hunter.service" "/etc/systemd/system/linuxdo-hunter.service" || return 1
     install_unit "$APP_DIR/linuxdo-hunter-checknow.service" "/etc/systemd/system/linuxdo-hunter-checknow.service" || return 1
     install_unit "$APP_DIR/linuxdo-hunter-watcher.service" "/etc/systemd/system/linuxdo-hunter-watcher.service" || return 1
@@ -84,7 +83,6 @@ update_repo() {
     LOCAL_VERSION="$(git show HEAD:version.txt 2>/dev/null || echo '?')"
     echo "[$(date -Is)] update $LOCAL_SHA -> $REMOTE_SHA (v$LOCAL_VERSION -> v$REMOTE_VERSION)"
 
-    # prompt.txt is intentionally taken from GitHub too; local prompt edits are not preserved.
     git reset --hard "origin/$BRANCH" >/dev/null || {
         notify "❌ Hunter: не удалось применить v$REMOTE_VERSION."; return 1;
     }
@@ -94,8 +92,7 @@ update_repo() {
 
     if [ -f "$APP_DIR/llm_router.py" ]; then
         if ! install_router; then
-            notify "⚠️ Hunter: v$REMOTE_VERSION загружена, но LLM router не прошёл health-check." 
-            # Do not restart the app against a known-dead router.
+            notify "⚠️ Hunter: v$REMOTE_VERSION загружена, но LLM router не прошёл health-check."
             return 1
         fi
     fi
@@ -104,7 +101,12 @@ update_repo() {
         notify "⚠️ Hunter: v$REMOTE_VERSION загружена, но hunter/checknow не перезапустились."; return 1;
     }
 
-    notify "✅ <b>Linux.do Hunter обновлён</b>\n\n📦 Версия: $LOCAL_VERSION → $REMOTE_VERSION\n🔄 Router + hunter + checknow перезапущены\n📝 prompt.txt взят из GitHub\n🔨 ${REMOTE_SHA:0:12}"
+    # Do not display a misleading "15 → 15" when only the Git commit changed.
+    if [ "$LOCAL_VERSION" = "$REMOTE_VERSION" ]; then
+        notify "✅ <b>Linux.do Hunter обновлён</b>\n\n📦 Версия: <b>$REMOTE_VERSION</b>\n🔄 Router + hunter + checknow перезапущены\n📝 prompt.txt взят из GitHub\n🔨 ${REMOTE_SHA:0:12}"
+    else
+        notify "✅ <b>Linux.do Hunter обновлён</b>\n\n📦 Версия: <b>$LOCAL_VERSION → $REMOTE_VERSION</b>\n🔄 Router + hunter + checknow перезапущены\n📝 prompt.txt взят из GitHub\n🔨 ${REMOTE_SHA:0:12}"
+    fi
 }
 
 # Initial self-heal: repair units/runtime/router even without a new Git commit.
