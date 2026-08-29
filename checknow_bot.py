@@ -27,7 +27,7 @@ MODES = {
     "normal": "Обычный: баланс ценности, новизны и доказательств.",
     "aggressive": "Агрессивный: не пропускать редкие free-tier, раздачи, loophole и abuse-находки; всё сомнительное маркировать.",
     "giveaway": "Раздачи: максимум внимания акциям, promo, credits, free-tier и массовым выдачам.",
-    "ai": "AI: приоритет AI API, модели, gateway, proxy, credits и дешёвый доступ.",
+    "ai": "AI: приоритет AI API, модели, gateway, proxy, credits и дешёвому доступу.",
     "cloud": "Cloud: приоритет VPS, cloud credits, storage и developer-инфраструктуре.",
     "chaos": "Максимальная чувствительность: ловить даже странные/серые находки, но не выдумывать факты и не выдавать инструкции для незаконного доступа.",
 }
@@ -57,7 +57,13 @@ def save_settings(settings):
 
 
 def get_updates(offset=None):
-    params = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
+    # Telegram expects allowed_updates as a JSON-serialized array.
+    # Passing a Python list directly through requests creates repeated query
+    # parameters and can result in callback_query updates being omitted.
+    params = {
+        "timeout": 25,
+        "allowed_updates": json.dumps(["message", "callback_query"]),
+    }
     if offset is not None:
         params["offset"] = offset
     r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates", params=params, timeout=35)
@@ -106,7 +112,7 @@ def score_menu():
     return kb([
         [{"text": "60", "callback_data": "score:60"}, {"text": "70", "callback_data": "score:70"}, {"text": "80", "callback_data": "score:80"}],
         [{"text": "90", "callback_data": "score:90"}, {"text": "95", "callback_data": "score:95"}],
-        [{"text": "⬅️ Назад", "callback_data": "menu:main"}],
+        [{"text": "⬅️ Назад", "callback_data": "menu:settings"}],
     ])
 
 
@@ -119,19 +125,21 @@ def limit_menu():
 
 
 def mode_menu():
+    settings = load_settings()
     rows = []
-    for name in MODES:
-        rows.append([{"text": f"{'✅ ' if load_settings()['mode'] == name else ''}{name}", "callback_data": f"mode:{name}"}])
+    for name, description in MODES.items():
+        rows.append([{"text": f"{'✅ ' if settings['mode'] == name else ''}{name}", "callback_data": f"mode:{name}"}])
     rows.append([{"text": "⬅️ Назад", "callback_data": "menu:main"}])
     return kb(rows)
 
 
 def settings_menu():
     s = load_settings()
+    alerts = "ON" if s.get("alerts", True) else "OFF"
     return kb([
         [{"text": f"🎯 Score: {s['score']}", "callback_data": "menu:score"}, {"text": f"🔎 Limit: {s['limit']}", "callback_data": "menu:limit"}],
         [{"text": f"🧠 Mode: {s['mode']}", "callback_data": "menu:mode"}],
-        [{"text": "🔔 Alerts ON", "callback_data": "alerts:toggle"}],
+        [{"text": f"🔔 Alerts: {alerts}", "callback_data": "alerts:toggle"}],
         [{"text": "⬅️ Главное меню", "callback_data": "menu:main"}],
     ])
 
@@ -145,11 +153,12 @@ def status_text():
     return (
         "🤖 <b>Linux.do Hunter</b>\n\n"
         f"📡 Источник: @{html.escape(TG_SOURCE_CHANNEL)}\n"
-        f"🧠 Groq API: {key}\n"
+        f"🧠 Router: {key}\n"
         f"🧠 Модели: <code>{html.escape(models)}</code>\n"
         f"🎯 Score: <b>{s['score']}</b>\n"
         f"🔎 Check limit: <b>{s['limit']}</b>\n"
         f"🧠 Mode: <b>{html.escape(s['mode'])}</b>\n"
+        f"🔔 Alerts: <b>{'ON' if s.get('alerts', True) else 'OFF'}</b>\n"
         f"🔐 Checknow session: {session}\n"
         "💾 Checknow SQLite: НЕ используется\n"
         f"⏱ Bot uptime: {uptime // 3600}ч {(uptime % 3600) // 60}м\n\n"
@@ -320,60 +329,82 @@ def handle_callback(update):
     message = cq.get("message") or {}
     if str((message.get("chat") or {}).get("id")) != CHAT_ID:
         return
-    answer_callback(cq["id"])
-    if data == "menu:main":
-        edit_message(message.get("message_id"), "🤖 <b>Linux.do Hunter</b>\n\nВыбирай действие кнопками ниже.", main_menu())
-    elif data == "menu:status":
-        edit_message(message.get("message_id"), status_text(), kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
-    elif data == "menu:help":
-        edit_message(message.get("message_id"), help_text(), kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
-    elif data == "menu:prompt":
-        p = read_prompt()
-        preview = p[:2500]
-        if len(p) > 2500:
-            preview += "\n…"
-        edit_message(message.get("message_id"), "📝 <b>Текущий prompt.txt</b>\n\n<pre>" + html.escape(preview) + "</pre>", kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
-    elif data == "menu:settings":
-        edit_message(message.get("message_id"), "⚙️ <b>Настройки</b>\n\nВыбирай параметр:", settings_menu())
-    elif data == "menu:score":
-        edit_message(message.get("message_id"), "🎯 <b>Минимальный Score</b>\n\nНиже — быстрый выбор.", score_menu())
-    elif data == "menu:limit":
-        edit_message(message.get("message_id"), "🔎 <b>Сколько постов проверять</b>\n\nМожно выбрать 20 / 50 / 75 / 100.", limit_menu())
-    elif data.startswith("score:"):
-        value = max(0, min(int(data.split(":", 1)[1]), 100))
-        s = load_settings(); s["score"] = value; save_settings(s)
-        edit_message(message.get("message_id"), f"✅ Score установлен: <b>{value}</b>", settings_menu())
-    elif data.startswith("limit:"):
-        value = max(1, min(int(data.split(":", 1)[1]), 100))
-        s = load_settings(); s["limit"] = value; save_settings(s)
-        edit_message(message.get("message_id"), f"✅ Лимит установлен: <b>{value}</b>", settings_menu())
-    elif data.startswith("mode:"):
-        mode = data.split(":", 1)[1]
-        if mode in MODES:
-            s = load_settings(); s["mode"] = mode; save_settings(s)
-            edit_message(message.get("message_id"), f"✅ Режим: <b>{mode}</b>\n{MODES[mode]}", mode_menu())
-    elif data == "alerts:toggle":
-        s = load_settings(); s["alerts"] = not bool(s.get("alerts", True)); save_settings(s)
-        answer_callback(cq["id"], f"Уведомления: {'ON' if s['alerts'] else 'OFF'}")
-        edit_message(message.get("message_id"), "⚙️ <b>Настройки</b>", settings_menu())
-    elif data.startswith("check:"):
-        limit = max(1, min(int(data.split(":", 1)[1]), 100))
-        answer_callback(cq["id"], f"Запускаю проверку {limit} постов")
-        asyncio.run(check_now(limit))
+    print(f"callback received: {data}", flush=True)
+    try:
+        answer_callback(cq["id"])
+    except Exception as e:
+        print(f"callback answer error: {e}", flush=True)
+    message_id = message.get("message_id")
+    try:
+        if data == "menu:main":
+            edit_message(message_id, "🤖 <b>Linux.do Hunter</b>\n\nВыбирай действие кнопками ниже.", main_menu())
+        elif data == "menu:status":
+            edit_message(message_id, status_text(), kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
+        elif data == "menu:help":
+            edit_message(message_id, help_text(), kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
+        elif data == "menu:prompt":
+            p = read_prompt()
+            preview = p[:2500] + ("\n…" if len(p) > 2500 else "")
+            edit_message(message_id, "📝 <b>Текущий prompt.txt</b>\n\n<pre>" + html.escape(preview) + "</pre>", kb([[{"text": "⬅️ Главное меню", "callback_data": "menu:main"}]]))
+        elif data == "menu:settings":
+            edit_message(message_id, "⚙️ <b>Настройки</b>\n\nВыбирай параметр:", settings_menu())
+        elif data == "menu:score":
+            edit_message(message_id, "🎯 <b>Минимальный Score</b>\n\nНиже — быстрый выбор.", score_menu())
+        elif data == "menu:limit":
+            edit_message(message_id, "🔎 <b>Сколько постов проверять</b>\n\nМожно выбрать 20 / 50 / 75 / 100.", limit_menu())
+        elif data == "menu:mode":
+            edit_message(message_id, "🧠 <b>Режим охоты</b>\n\nВыбери режим. Изменение применяется сразу к следующему анализу.", mode_menu())
+        elif data.startswith("score:"):
+            value = max(0, min(int(data.split(":", 1)[1]), 100))
+            s = load_settings(); s["score"] = value; save_settings(s)
+            edit_message(message_id, f"✅ Score установлен: <b>{value}</b>", settings_menu())
+        elif data.startswith("limit:"):
+            value = max(1, min(int(data.split(":", 1)[1]), 100))
+            s = load_settings(); s["limit"] = value; save_settings(s)
+            edit_message(message_id, f"✅ Лимит установлен: <b>{value}</b>", settings_menu())
+        elif data.startswith("mode:"):
+            mode = data.split(":", 1)[1]
+            if mode in MODES:
+                s = load_settings(); s["mode"] = mode; save_settings(s)
+                edit_message(message_id, f"✅ Режим: <b>{html.escape(mode)}</b>\n\n{html.escape(MODES[mode])}", mode_menu())
+        elif data == "alerts:toggle":
+            s = load_settings(); s["alerts"] = not bool(s.get("alerts", True)); save_settings(s)
+            edit_message(message_id, "⚙️ <b>Настройки</b>", settings_menu())
+        elif data.startswith("check:"):
+            limit = max(1, min(int(data.split(":", 1)[1]), 100))
+            try:
+                answer_callback(cq["id"], f"Запускаю проверку {limit} постов")
+            except Exception:
+                pass
+            asyncio.run(check_now(limit))
+        else:
+            print(f"unknown callback: {data}", flush=True)
+    except Exception as e:
+        print(f"callback {data}: {e}", flush=True)
+        try:
+            answer_callback(cq["id"], "Ошибка: смотри журнал бота", alert=True)
+        except Exception:
+            pass
 
 
 def main():
     offset = None
+    # Make polling mode deterministic. This is harmless when no webhook is configured.
+    try:
+        api_call("deleteWebhook", {"drop_pending_updates": False})
+    except Exception as e:
+        print(f"deleteWebhook: {e}", flush=True)
     print("Telegram command bot active: /menu /checknow /status /settings", flush=True)
     while True:
         try:
-            for update in get_updates(offset):
+            updates = get_updates(offset)
+            for update in updates:
                 offset = update["update_id"] + 1
                 if update.get("callback_query"):
                     try:
                         handle_callback(update)
                     except Exception as e:
-                        print(f"callback: {e}", flush=True)
+                        print(f"callback handler: {e}", flush=True)
                     continue
                 message = update.get("message") or {}
                 chat = message.get("chat") or {}
