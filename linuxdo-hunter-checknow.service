@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/linuxdo-hunter
 EnvironmentFile=/etc/linuxdo-hunter.env
-ExecStart=/opt/linuxdo-hunter/.venv/bin/python /opt/linuxdo-hunter/checknow_bot.py
+ExecStart=/opt/linuxdo-hunter/.venv/bin/python /opt/linuxdo-hunter/checknow_buttons.py
 Restart=always
 RestartSec=5
 
