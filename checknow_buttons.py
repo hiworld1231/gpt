@@ -7,7 +7,6 @@ slash-command menu shown when the user types '/'.
 """
 import asyncio
 import html
-import json
 import threading
 
 from telethon import TelegramClient
@@ -45,21 +44,21 @@ def _fetch_message(message_id, source=None):
     return asyncio.run(run())
 
 
-def _run_detail(source_id, callback_message_id, task):
+def _run_detail(source, source_id, callback_message_id, task):
     if not _LOCK.acquire(blocking=False):
         bot.edit_message(callback_message_id, "⏳ <b>Другая проверка уже выполняется.</b>", bot.kb([[{"text": "⬅️ Меню", "callback_data": "menu:main"}]]))
         return
     try:
         bot.edit_message(callback_message_id, "⏳ <b>Проверяю…</b>\n\nПолучаю исходный пост и запускаю расширенный анализ.")
-        message = _fetch_message(source_id)
+        message = _fetch_message(source_id, source)
         text = (message.raw_text or "").strip()
-        url = bot.telegram_url(message)
+        url = f"https://t.me/{source}/{message.id}"
         published = message.date.astimezone(bot.timezone.utc).isoformat() if message.date else "неизвестно"
         original_url = bot.extract_linuxdo_url(text)
         original_title, original_text = ("", "")
         if original_url:
             original_title, original_text = bot.fetch_linuxdo_thread(original_url)
-        material = f"[Дата публикации Telegram: {published}]\n{text}"
+        material = f"[Telegram-источник: @{source}]\n[Дата публикации Telegram: {published}]\n{text}"
         if original_text:
             material += f"\n\n[ОРИГИНАЛЬНЫЙ LINUX.DO ТРЕД]\n{original_text}"
         base_prompt = bot.read_prompt()
@@ -95,15 +94,15 @@ def _run_detail(source_id, callback_message_id, task):
             f"⚠️ <b>Риск/лимиты:</b> {html.escape(str(result.get('risk', '')))}\n"
             f"📚 <b>Доказательства:</b> {html.escape(str(result.get('evidence', '')))}\n"
             f"⚖️ <b>Вердикт:</b> {html.escape(str(result.get('verdict', '')))}\n\n"
-            f"🔗 {html.escape(url)}"
+            f"🔗 {html.escape(url)}\n📡 <b>Источник:</b> @{html.escape(source)}"
         )
         if original_url:
             out += f"\n🔎 <b>Оригинал:</b> {html.escape(original_url)}"
-        bot.edit_message(callback_message_id, out, bot.result_keyboard(source_id))
+        bot.edit_message(callback_message_id, out, bot.result_keyboard(source, source_id))
     except Exception as e:
-        print(f"{task} {source_id}: {e}", flush=True)
+        print(f"{task} @{source}/{source_id}: {e}", flush=True)
         try:
-            bot.edit_message(callback_message_id, f"❌ <b>{task.title()} не удался</b>\n\n<code>{html.escape(str(e)[:1000])}</code>", bot.result_keyboard(source_id))
+            bot.edit_message(callback_message_id, f"❌ <b>{task.title()} не удался</b>\n\n<code>{html.escape(str(e)[:1000])}</code>", bot.result_keyboard(source, source_id))
         except Exception:
             pass
     finally:
@@ -144,7 +143,6 @@ async def _multi_search_and_comments(queries):
                     comments[(source, mid)] = replies
             except Exception as e:
                 print(f"discussion @{source} {mid}: {e}", flush=True)
-        # Keep source metadata on the message object so existing ranking/analysis can use it.
         result = []
         for (source, mid), (message, _) in posts.items():
             try:
@@ -157,8 +155,6 @@ async def _multi_search_and_comments(queries):
         await client.disconnect()
 
 
-# Replace the retrieval stage used by the existing AI search engine. The LLM still
-# plans/ranks; Telegram performs the actual search for every configured source.
 search_engine._search_and_comments = _multi_search_and_comments
 
 
@@ -189,10 +185,18 @@ def _multi_result(result, message, comments):
     return out
 
 
-# Patch the two helper functions used by enhanced_search_now without duplicating its
-# AI planning/ranking pipeline.
 search_engine._search_context = _multi_search_context
 search_engine._enhanced_search_result = _multi_result
+
+
+def _result_keyboard(source, message_id):
+    return bot.kb([
+        [{"text": "🔍 Deep Check", "callback_data": f"deep:{source}:{message_id}"}, {"text": "✅ Verify", "callback_data": f"verify:{source}:{message_id}"}],
+        [{"text": "🔗 Открыть", "url": f"https://t.me/{source}/{message_id}"}, {"text": "⬅️ Меню", "callback_data": "menu:main"}],
+    ])
+
+
+bot.result_keyboard = _result_keyboard
 
 
 def fixed_handle_callback(update):
@@ -204,12 +208,20 @@ def fixed_handle_callback(update):
     print(f"callback received: {data}", flush=True)
     if data.startswith("deep:") or data.startswith("verify:"):
         try:
-            source_id = int(data.split(":", 1)[1])
-            task = "deep" if data.startswith("deep:") else "verify"
+            parts = data.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError("invalid detail callback")
+            task = "deep" if parts[0] == "deep" else "verify"
+            source = source_manager.normalize_source(parts[1])
+            source_id = int(parts[2])
             bot.answer_callback(cq["id"], "Deep Check запущен" if task == "deep" else "Verify запущен")
-            threading.Thread(target=_run_detail, args=(source_id, message.get("message_id"), task), daemon=True).start()
+            threading.Thread(target=_run_detail, args=(source, source_id, message.get("message_id"), task), daemon=True).start()
         except Exception as e:
             print(f"detail callback: {e}", flush=True)
+            try:
+                bot.answer_callback(cq["id"], "Ошибка запуска проверки", alert=True)
+            except Exception:
+                pass
         return
     return _original_handle_callback(update)
 
