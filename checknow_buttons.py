@@ -189,7 +189,12 @@ search_engine._search_context = _multi_search_context
 search_engine._enhanced_search_result = _multi_result
 
 
-def _result_keyboard(source, message_id):
+def _result_keyboard(source, message_id=None):
+    # Existing checknow_bot calls this with only message_id; those results always
+    # belong to the primary hunter channel. Search results pass source + message_id.
+    if message_id is None:
+        message_id = source
+        source = bot.TG_SOURCE_CHANNEL
     return bot.kb([
         [{"text": "🔍 Deep Check", "callback_data": f"deep:{source}:{message_id}"}, {"text": "✅ Verify", "callback_data": f"verify:{source}:{message_id}"}],
         [{"text": "🔗 Открыть", "url": f"https://t.me/{source}/{message_id}"}, {"text": "⬅️ Меню", "callback_data": "menu:main"}],
@@ -265,7 +270,8 @@ def _handle_source_command(raw):
         elif sub in ("add", "+") and len(parts) >= 3:
             added, sources = source_manager.add_source(bot, parts[2])
             if added:
-                bot.send_message("✅ Источник добавлен: <b>@%s</b>\n\n%s" % (html.escape(parts[2].lstrip("@")), "\n".join(f"{i}. @{s}" for i, s in enumerate(sources, 1))))
+                source = source_manager.normalize_source(parts[2])
+                bot.send_message("✅ Источник добавлен: <b>@%s</b>\n\n%s" % (html.escape(source), "\n".join(f"{i}. @{s}" for i, s in enumerate(sources, 1))))
             else:
                 bot.send_message("ℹ️ Этот источник уже есть в списке.")
         elif sub in ("remove", "rm", "-", "del") and len(parts) >= 3:
