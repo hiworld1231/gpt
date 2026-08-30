@@ -3,6 +3,7 @@
 import asyncio
 import html
 import json
+import os
 from datetime import timezone
 
 from telethon import TelegramClient
@@ -10,9 +11,6 @@ from telethon.sessions import StringSession
 
 import checknow_bot as bot
 
-
-# No artificial query-count cap: the planner may generate as many useful
-# short search variants as are needed for the user's request.
 MAX_RETRIEVED = 120
 MAX_COMMENTS_PER_POST = 40
 
@@ -23,8 +21,23 @@ def _client():
     return TelegramClient(StringSession(bot.TG_CHECKNOW_STRING_SESSION), int(bot.TG_API_ID), bot.TG_API_HASH)
 
 
+def _search_languages():
+    """Languages used for Telegram search, in priority order.
+
+    Configure with SEARCH_LANGUAGES=zh,en for a Chinese/English source.
+    Russian is intentionally NOT a default for Chinese-focused sources.
+    """
+    raw = os.getenv("SEARCH_LANGUAGES", "zh,en").strip()
+    langs = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    allowed = {"zh", "en", "ru", "ja", "ko"}
+    return [x for x in langs if x in allowed] or ["zh", "en"]
+
+
 def _fallback_plan(request):
-    return {"queries": [request], "max_results": 10, "language_notes": "", "intent": request}
+    # Never send a long natural-language user request directly to Telegram search.
+    words = request.split()
+    literal = request if len(words) <= 4 else (words[0] if words else request)
+    return {"queries": [literal], "max_results": 10, "language_notes": "", "intent": request}
 
 
 def plan_search(request):
@@ -32,30 +45,34 @@ def plan_search(request):
     if not bot.LLM_API_KEY:
         return _fallback_plan(request)
 
-    prompt = f'''Ты планировщик поиска по Telegram-каналам.
+    languages = _search_languages()
+    language_names = {"zh": "китайском (简体中文)", "en": "английском", "ru": "русском", "ja": "японском", "ko": "корейском"}
+    requested_languages = ", ".join(language_names[x] for x in languages)
+    prompt = f'''Ты планировщик поиска по Telegram.
 Пользователь написал:
 {request}
 
-Твоя задача — превратить запрос в НАБОР КОРОТКИХ поисковых запросов для Telegram.
+Источник ориентирован на языки: {requested_languages}.
+Генерируй поисковые запросы ТОЛЬКО на этих языках. НЕ генерируй русский, если ru не указан.
 Telegram будет выполнять КАЖДЫЙ запрос отдельно. Ограничения на количество запросов НЕТ.
-Генерируй столько действительно полезных вариантов, сколько нужно для широкого поиска.
+
+Задача: найти реальные сообщения, относящиеся к смыслу запроса пользователя.
 
 ВАЖНО:
-- Не пиши длинные предложения и вопросы.
-- Каждый запрос должен выглядеть как реальный поисковый запрос пользователя Telegram: обычно 1–4 слова.
-- Сначала извлеки точные термины из запроса.
-- Добавляй варианты написания: например TikTok, Tik Tok, tiktok.
-- Добавляй комбинации ключевых терминов: например tiktok username, tiktok python, tiktok api.
-- Для технических тем добавляй английские варианты и распространённые русские варианты.
-- Для китайской аудитории добавляй распространённые китайские термины, если тема это допускает.
-- Добавляй названия инструментов, технологий, функций и предметных терминов, которые логично связаны с запросом.
-- Не превращай один запрос в длинное описание намерения.
-- Не ограничивайся 10/12/20 запросами. Если полезных вариантов 30, верни 30; если 60 — верни 60.
-- Не добавляй мусорные сверхобщие слова вроде "code", "python", "api" отдельно, если они не являются самостоятельной частью смысла.
-- Дедуплицируй одинаковые запросы без учёта регистра.
+- НЕ копируй пользовательский запрос целиком, если это длинное предложение.
+- Каждый запрос должен быть коротким: обычно 1–4 слова.
+- Для каждой важной сущности делай варианты написания и короткие комбинации.
+- Пример для TikTok: tiktok, tik tok, tiktok python, tik tok python, tiktok username, tik tok username, tiktok api.
+- Для китайского поиска используй естественные китайские термины, а не машинный перевод русского предложения.
+- Для английского используй естественные английские технические термины.
+- Ищи названия продуктов, функций, API, инструментов и короткие тематические сочетания.
+- Не добавляй длинные вопросы, предложения, инструкции или объяснения.
+- Не добавляй русские слова/фразы, если русский язык не входит в список источников.
+- Не добавляй сверхобщие одиночные слова вроде code/python/api, если они сами по себе не являются полезным поисковым термином.
+- Дедуплицируй запросы без учёта регистра.
 
 Верни СТРОГО JSON:
-{{"queries":["tiktok","tik tok","tiktok python","tik tok python","tiktok username","tik tok username"],"max_results":10,"intent":"кратко что ищем","language_notes":"языки и варианты"}}
+{{"queries":["tiktok","tik tok","tiktok python","tiktok username"],"max_results":10,"intent":"кратко что ищем","language_notes":"использованные языки"}}
 '''
     try:
         plan = bot.call_model(bot.MODELS[0], prompt)
@@ -63,17 +80,22 @@ Telegram будет выполнять КАЖДЫЙ запрос отдельн�
         seen = set()
         for raw in plan.get("queries", []):
             q = str(raw).strip()
-            if not q:
+            if not q or len(q) > 100:
                 continue
-            q = q[:100]
+            # Reject long natural-language queries even if the model ignores the prompt.
+            if len(q.split()) > 6:
+                continue
             key = q.casefold()
             if key not in seen:
                 seen.add(key)
                 queries.append(q)
-        # Always retain the user's literal request as one search variant.
-        if request.casefold() not in seen:
-            queries.insert(0, request[:100])
 
+        # Only retain the literal request when it is already a short search term.
+        if len(request.split()) <= 4 and request.casefold() not in seen:
+            queries.insert(0, request)
+
+        if not queries:
+            return _fallback_plan(request)
         try:
             max_results = max(1, int(plan.get("max_results", 10)))
         except Exception:
@@ -82,7 +104,7 @@ Telegram будет выполнять КАЖДЫЙ запрос отдельн�
             "queries": queries,
             "max_results": max_results,
             "intent": str(plan.get("intent", request))[:500],
-            "language_notes": str(plan.get("language_notes", ""))[:500],
+            "language_notes": str(plan.get("language_notes", requested_languages))[:500],
         }
     except Exception as e:
         print(f"search planner fallback: {e}", flush=True)
@@ -97,8 +119,6 @@ async def _search_and_comments(queries):
             raise RuntimeError("checknow Telegram session не авторизована")
         entity = await client.get_entity(bot.TG_SOURCE_CHANNEL)
         posts = {}
-        # Query count is intentionally unlimited. Retrieval is still bounded so
-        # one huge search cannot exhaust memory or run forever.
         per_query = 40
         for query in queries:
             try:
@@ -179,9 +199,6 @@ async def enhanced_search_now(request, limit=30):
 
     plan = await asyncio.to_thread(plan_search, request)
     queries = plan["queries"]
-    # User result limit is separate from the number of search queries. If no
-    # explicit result limit is supplied, keep the existing default; search
-    # query generation itself is completely uncapped.
     requested_max = plan["max_results"]
     try:
         hard_limit = max(1, int(limit))
@@ -194,7 +211,8 @@ async def enhanced_search_now(request, limit=30):
         f"🧠 Запрос: <code>{html.escape(request)}</code>\n"
         f"🎯 Цель: максимум <b>{requested_max}</b> результатов\n"
         f"🔎 Поисковых фраз: <b>{len(queries)}</b>\n"
-        "🌐 Ищу короткими ключевыми фразами и вариантами написания…"
+        f"🌐 Языки: <b>{html.escape(', '.join(_search_languages()))}</b>\n"
+        "🔎 Ищу короткими ключевыми фразами…"
     )
     bot.send_message("<b>Стратегия:</b>\n" + "\n".join(f"• {html.escape(q)}" for q in queries))
 
