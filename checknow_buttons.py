@@ -7,7 +7,10 @@ slash-command menu shown when the user types '/'.
 """
 import asyncio
 import html
+import os
 import threading
+import fcntl
+import json
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -277,19 +280,51 @@ def _handle_source_command(raw):
         bot.send_message(f"❌ /source: <code>{html.escape(str(e)[:700])}</code>")
 
 
+# Telegram getUpdates is effectively a queue, but duplicate pollers (for example
+# an old systemd instance left running during a restart) can receive the same
+# pending update. The old implementation then sent /source's reply once per
+# poller and the user got an endless-looking spam burst. Keep a tiny persistent
+# update-id ledger so every /source update is handled at most once per host.
+_DEDUPE_FILE = os.getenv("BOT_COMMAND_DEDUPE_FILE", "/var/lib/linuxdo-hunter/handled_command_updates.json")
+_DEDUPE_LOCK = _DEDUPE_FILE + ".lock"
+_DEDUPE_KEEP = 500
+
+
+def _claim_source_update(update_id):
+    os.makedirs(os.path.dirname(_DEDUPE_FILE), exist_ok=True)
+    with open(_DEDUPE_LOCK, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                with open(_DEDUPE_FILE, "r", encoding="utf-8") as f:
+                    ids = json.load(f)
+                if not isinstance(ids, list):
+                    ids = []
+            except Exception:
+                ids = []
+            key = int(update_id)
+            if key in ids:
+                return False
+            ids.append(key)
+            ids = ids[-_DEDUPE_KEEP:]
+            tmp = _DEDUPE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(ids, f)
+            os.replace(tmp, _DEDUPE_FILE)
+            return True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 _original_get_updates = bot.get_updates
 
 
 def _get_updates_with_source(offset=None):
-    """Handle /source without re-delivering the same Telegram update.
+    """Handle /source exactly once while still advancing Telegram's offset.
 
-    IMPORTANT: bot.main() advances its polling offset from every update it
-    receives. The previous implementation consumed /source updates by
-    removing them from the returned list, so main() never advanced the offset
-    and Telegram returned the same /source message forever, causing spam.
-    We now keep the update and replace only its text after handling it; this
-    lets main() advance the offset exactly once while preventing the command
-    from being handled a second time.
+    We keep the original update in the returned batch so bot.main() advances
+    its offset normally. A persistent cross-process ledger prevents duplicate
+    handling if two copies of the command bot briefly poll the same bot token.
     """
     updates = _original_get_updates(offset)
     for update in updates:
@@ -300,9 +335,11 @@ def _get_updates_with_source(offset=None):
         raw = (message.get("text") or "").strip()
         command = raw.split()[0].lower() if raw else ""
         if command in ("/source", "/sources"):
-            _handle_source_command(raw if command == "/source" else "/source list")
-            # Keep the update so main() advances offset, but make it inert.
-            # Do not delete it from the returned batch.
+            update_id = update.get("update_id")
+            if update_id is None or _claim_source_update(update_id):
+                _handle_source_command(raw if command == "/source" else "/source list")
+            # Keep the update so main() advances offset exactly once, but make
+            # it inert in case the normal command dispatcher sees it.
             message["text"] = "/__source_handled__"
     return updates
 
