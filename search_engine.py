@@ -23,7 +23,6 @@ def _client():
 
 
 def _search_languages():
-    """Languages used for Telegram search, in priority order."""
     raw = os.getenv("SEARCH_LANGUAGES", "zh,en").strip()
     langs = [x.strip().lower() for x in raw.split(",") if x.strip()]
     allowed = {"zh", "en", "ru", "ja", "ko"}
@@ -37,43 +36,54 @@ def _fallback_plan(request):
 
 
 def plan_search(request):
-    """Use the LLM only to expand the request into short Telegram search terms."""
+    """Expand into many short, overlapping Telegram search terms."""
     if not bot.LLM_API_KEY:
         return _fallback_plan(request)
-
     languages = _search_languages()
     language_names = {"zh": "китайском (简体中文)", "en": "английском", "ru": "русском", "ja": "японском", "ko": "корейском"}
     requested_languages = ", ".join(language_names[x] for x in languages)
-    prompt = f'''Ты планировщик поиска по Telegram.
-Пользователь написал:
+    prompt = f'''Ты планировщик ПОИСКА по Telegram. Пользователь написал:
 {request}
 
 Источник ориентирован на языки: {requested_languages}.
-Генерируй поисковые запросы ТОЛЬКО на этих языках. НЕ генерируй русский, если ru не указан.
-Telegram будет выполнять КАЖДЫЙ запрос отдельно. Ограничения на количество запросов НЕТ.
+Генерируй запросы только на этих языках. Русский запрещён, если ru не указан.
 
-Задача: найти реальные сообщения, относящиеся к смыслу запроса пользователя.
+Твоя задача — НЕ угадать один идеальный запрос, а сделать МАКСИМАЛЬНО ШИРОКУЮ сетку коротких поисковых фраз. Telegram выполняет каждый запрос отдельно.
 
-ВАЖНО:
-- НЕ копируй пользовательский запрос целиком, если это длинное предложение.
-- Каждый запрос должен быть коротким: обычно 1–4 слова.
-- Для каждой важной сущности делай варианты написания и короткие комбинации.
-- Пример для TikTok: tiktok, tik tok, tiktok python, tik tok python, tiktok username, tik tok username, tiktok api.
-- Для китайского поиска используй естественные китайские термины, а не машинный перевод русского предложения.
-- Для английского используй естественные английские технические термины.
-- Ищи названия продуктов, функций, API, инструментов и короткие тематические сочетания.
-- Не добавляй длинные вопросы, предложения, инструкции или объяснения.
-- Не добавляй русские слова/фразы, если русский язык не входит в список источников.
-- Не добавляй сверхобщие одиночные слова вроде code/python/api, если они сами по себе не являются полезным поисковым термином.
-- Дедуплицируй запросы без учёта регистра.
+ОБЯЗАТЕЛЬНАЯ СТРАТЕГИЯ:
+1. Выдели сущности/темы пользователя: продукты, сервисы, технологии, функции, действия, языковые термины.
+2. Для КАЖДОЙ важной сущности создай отдельные варианты написания. Например: tiktok и tik tok; если уместно — китайское название 抖音.
+3. Для каждого важного термина создай комбинации с каждой связанной сущностью. НЕ склеивай всё в одну длинную фразу.
+4. Если пользователь ищет действие/контекст вроде abuse, exploit, bypass, username, api, python — ЭТИ ТЕРМИНЫ можно использовать, но отдельно и в комбинациях с сущностями.
+5. Например для TikTok + API + username + abuse нужны ВСЕ такие типы, где они уместны:
+   tiktok
+   tik tok
+   tiktok api
+   tik tok api
+   tiktok username
+   tik tok username
+   tiktok abuse
+   tik tok abuse
+   tiktok api abuse
+   tik tok api abuse
+   tiktok username abuse
+   tik tok username abuse
+   tiktok python
+   tik tok python
+6. Не заменяй tiktok на только abuse/hack. Название сущности должно иметь самостоятельные запросы.
+7. Не придумывай новые смысловые цели, которых нет у пользователя. Но можешь использовать естественные языковые варианты и синонимы уже указанного действия.
+8. Для китайского используй естественные китайские варианты соответствующих терминов. Для английского — естественные английские.
+9. Каждый запрос обычно 1–4 слова/термина. Не пиши предложения.
+10. Дедуплицируй только точные/очевидные дубли. Разные комбинации сохраняй.
+11. Количество запросов НЕ ограничивай искусственно. Лучше больше коротких пересекающихся запросов, чем несколько длинных.
+12. Не добавляй пользовательский длинный текст как поисковую фразу.
 
 Верни СТРОГО JSON:
-{{"queries":["tiktok","tik tok","tiktok python","tiktok username"],"max_results":10,"intent":"кратко что ищем","language_notes":"использованные языки"}}
+{{"queries":["tiktok","tik tok","tiktok api","tik tok api","tiktok username","tik tok username","tiktok abuse","tik tok abuse"],"max_results":10,"intent":"краткая цель","language_notes":"языки"}}
 '''
     try:
         plan = bot.call_model(bot.MODELS[0], prompt)
-        queries = []
-        seen = set()
+        queries, seen = [], set()
         for raw in plan.get("queries", []):
             q = str(raw).strip()
             if not q or len(q) > 100 or len(q.split()) > 6:
@@ -138,30 +148,15 @@ def _rank_hits(request, posts, comments):
         text = (m.raw_text or "").strip()
         reply_text = "\n".join(comments.get(m.id, [])[:12])
         chunks.append({"id": m.id, "text": text[:2500], "comments": reply_text[:2500]})
-    prompt = f'''Ты НЕ анализатор новостей. Ты строгий фильтр релевантности результатов Telegram search.
+    prompt = f'''Ты строгий фильтр релевантности результатов Telegram search.
+Запрос пользователя: {request}
 
-Запрос пользователя:
-{request}
+Совпадение по одному слову НЕ означает релевантность.
+Оставляй высоко только то, что реально помогает ответить на исходный запрос. Учитывай содержательные комментарии.
+Обычные новости/анонсы без нужной практической информации оцени низко.
 
-Нужно оставить ТОЛЬКО сообщения, которые реально помогают ответить на запрос пользователя.
-Ключевое правило: совпадение по слову само по себе НЕ является релевантностью.
-
-Например, если пользователь ищет abuse/loophole/код/способ использования TikTok, Stripe или Cursor, обычная новость о том, что компания что-то разрабатывает, даже если в ней встречается нужное название, должна получить очень низкую релевантность и быть исключена.
-Исключай:
-- обычные новости и анонсы без практической информации по запросу;
-- общие обсуждения продукта без нужного пользователю материала;
-- маркетинг, пресс-релизы и новости, где ключевое слово только случайно совпало;
-- посты, которые не относятся к цели запроса.
-
-Высокая релевантность (70-100) только если пост содержит или обсуждает конкретно нужную пользователю информацию: код, метод, рабочий пример, обход ограничения, loophole, exploit/research, API-детали, практический способ, полезный сервис/инструмент, реальные результаты или содержательные комментарии по теме.
-40-69 = частично полезно/контекст, но не основной результат.
-0-39 = шум, случайное совпадение или обычная новость.
-
-Комментарии тоже учитывай: пост сам по себе может быть обычным, но комментарии могут содержать нужную информацию. Если полезны только комментарии, оцени пост по ним.
-
-Верни СТРОГО JSON: {{"ranking":[{{"id":123,"relevance":0-100,"reason":"кратко почему"}}]}}
-В ranking включи ВСЕ кандидаты, отсортируй от самых релевантных.
-
+Верни СТРОГО JSON: {{"ranking":[{{"id":123,"relevance":0-100,"reason":"кратко"}}]}}
+Включи ВСЕ кандидаты.
 КАНДИДАТЫ:
 {json.dumps(chunks, ensure_ascii=False)}'''
     try:
@@ -219,7 +214,7 @@ async def enhanced_search_now(request, limit=30):
     candidates = relevant[:min(MAX_RETRIEVED, max(requested_max * 4, requested_max))]
     bot.send_message(f"📚 Telegram нашёл <b>{len(posts)}</b> уникальных постов.\n💬 Обработаны обсуждения найденных постов.\n🎯 Релевантных кандидатов ≥ {SEARCH_RELEVANCE_THRESHOLD}: <b>{len(relevant)}</b>\n🤖 Глубоко анализирую топ <b>{len(candidates)}</b>…")
     if not candidates:
-        bot.send_message("❌ <b>Релевантных результатов не найдено.</b> Совпадения по названию/слову были, но содержательно они не отвечают запросу.")
+        bot.send_message("❌ <b>Релевантных результатов не найдено.</b> Совпадения по словам были, но содержательно они не отвечают запросу.")
         return
     results = []
     settings = bot.load_settings()
@@ -231,9 +226,7 @@ async def enhanced_search_now(request, limit=30):
             material = _search_context(message, comments, queries, request)
             result = await asyncio.to_thread(bot.analyze_without_db, bot.telegram_title(text), material, url, published_at, settings["mode"])
             score = int(result.get("score", 0))
-            # A search result must be relevant to the user's query, regardless of Hunter's generic score.
-            if relevance >= SEARCH_RELEVANCE_THRESHOLD:
-                results.append((score, relevance, message, result))
+            results.append((score, relevance, message, result))
         except Exception as e:
             print(f"search analyze {message.id}: {e}", flush=True)
         if idx % 5 == 0:
@@ -246,4 +239,4 @@ async def enhanced_search_now(request, limit=30):
     for score, relevance, message, result in results:
         bot.send_message(_enhanced_search_result(result, message, comments), bot.result_keyboard(message.id))
         await asyncio.sleep(0.2)
-    bot.send_message(f"✅ <b>AI Search завершён</b>\n🔎 Запрос: <code>{html.escape(request)}</code>\n📚 Найдено Telegram: {len(posts)}\n💬 Посты с обсуждениями: {sum(1 for x in comments.values() if x)}\n🎯 Релевантных: {len(relevant)}\n🏆 Выдано результатов: <b>{len(results)}</b>")
+    bot.send_message(f"✅ <b>AI Search завершён</b>\n🔎 Запрос: <code>{html.escape(request)}</code>\n📚 Найдено Telegram: {len(posts)}\n💬 Посты с обсуждениями: {sum(1 for x in comments.values() if x)}\n🏆 Выдано результатов: <b>{len(results)}</b>")
