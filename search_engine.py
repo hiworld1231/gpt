@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""AI-assisted Telegram search for Linux.do Hunter.
-
-The LLM plans search queries; Telegram performs the actual retrieval.  Results
-are deduplicated, discussion replies are collected where Telegram exposes them,
-and only the most relevant hits are sent to the user for analysis.
-"""
+"""AI-assisted Telegram search for Linux.do Hunter."""
 import asyncio
 import html
 import json
-import os
-import re
 from datetime import timezone
 
 from telethon import TelegramClient
@@ -18,7 +11,8 @@ from telethon.sessions import StringSession
 import checknow_bot as bot
 
 
-MAX_SEARCH_QUERIES = 12
+# No artificial query-count cap: the planner may generate as many useful
+# short search variants as are needed for the user's request.
 MAX_RETRIEVED = 120
 MAX_COMMENTS_PER_POST = 40
 
@@ -26,63 +20,66 @@ MAX_COMMENTS_PER_POST = 40
 def _client():
     if not bot.TG_API_ID or not bot.TG_API_HASH or not bot.TG_CHECKNOW_STRING_SESSION:
         raise RuntimeError("Telegram API/session не настроены")
-    return TelegramClient(
-        StringSession(bot.TG_CHECKNOW_STRING_SESSION),
-        int(bot.TG_API_ID),
-        bot.TG_API_HASH,
-    )
+    return TelegramClient(StringSession(bot.TG_CHECKNOW_STRING_SESSION), int(bot.TG_API_ID), bot.TG_API_HASH)
 
 
 def _fallback_plan(request):
-    return {
-        "queries": [request],
-        "max_results": 10,
-        "language_notes": "",
-        "intent": request,
-    }
+    return {"queries": [request], "max_results": 10, "language_notes": "", "intent": request}
 
 
 def plan_search(request):
-    """Ask the router to turn a natural-language request into Telegram queries."""
+    """Use the LLM only to expand the request into short Telegram search terms."""
     if not bot.LLM_API_KEY:
         return _fallback_plan(request)
-    prompt = f"""Ты планировщик поиска по Telegram-каналу с IT/AI/dev материалами.
-Пользователь написал естественным языком:
+
+    prompt = f'''Ты планировщик поиска по Telegram-каналам.
+Пользователь написал:
 {request}
 
-Сформируй поисковую стратегию. Важно: ты НЕ ищешь сам и НЕ придумываешь результаты.
-Telegram будет выполнять каждый поисковый запрос отдельно.
+Твоя задача — превратить запрос в НАБОР КОРОТКИХ поисковых запросов для Telegram.
+Telegram будет выполнять КАЖДЫЙ запрос отдельно. Ограничения на количество запросов НЕТ.
+Генерируй столько действительно полезных вариантов, сколько нужно для широкого поиска.
 
-Нужно:
-- понять, что именно хочет пользователь;
-- извлечь максимум результатов, если пользователь его указал (иначе 10);
-- сделать до {MAX_SEARCH_QUERIES} коротких поисковых фраз;
-- включить точную фразу/термины пользователя;
-- добавить близкие синонимы, названия технологий и разговорные формулировки;
-- для технических тем добавить английские варианты;
-- при необходимости добавить русские и английские варианты терминов отдельно;
-- искать не только очевидное слово, но и формулировки, которыми люди могли описывать тот же способ/инструмент/проблему.
-
-НЕ добавляй слишком общие слова вроде "code", "python", "api", если они сами по себе не помогают найти нужное.
+ВАЖНО:
+- Не пиши длинные предложения и вопросы.
+- Каждый запрос должен выглядеть как реальный поисковый запрос пользователя Telegram: обычно 1–4 слова.
+- Сначала извлеки точные термины из запроса.
+- Добавляй варианты написания: например TikTok, Tik Tok, tiktok.
+- Добавляй комбинации ключевых терминов: например tiktok username, tiktok python, tiktok api.
+- Для технических тем добавляй английские варианты и распространённые русские варианты.
+- Для китайской аудитории добавляй распространённые китайские термины, если тема это допускает.
+- Добавляй названия инструментов, технологий, функций и предметных терминов, которые логично связаны с запросом.
+- Не превращай один запрос в длинное описание намерения.
+- Не ограничивайся 10/12/20 запросами. Если полезных вариантов 30, верни 30; если 60 — верни 60.
+- Не добавляй мусорные сверхобщие слова вроде "code", "python", "api" отдельно, если они не являются самостоятельной частью смысла.
+- Дедуплицируй одинаковые запросы без учёта регистра.
 
 Верни СТРОГО JSON:
-{{"queries":["..."],"max_results":10,"intent":"кратко что ищем","language_notes":"какие языки/синонимы использованы"}}
-"""
+{{"queries":["tiktok","tik tok","tiktok python","tik tok python","tiktok username","tik tok username"],"max_results":10,"intent":"кратко что ищем","language_notes":"языки и варианты"}}
+'''
     try:
         plan = bot.call_model(bot.MODELS[0], prompt)
         queries = []
-        for q in plan.get("queries", []):
-            q = str(q).strip()
-            if q and q.lower() not in {x.lower() for x in queries}:
-                queries.append(q[:100])
-        if request.lower() not in {x.lower() for x in queries}:
+        seen = set()
+        for raw in plan.get("queries", []):
+            q = str(raw).strip()
+            if not q:
+                continue
+            q = q[:100]
+            key = q.casefold()
+            if key not in seen:
+                seen.add(key)
+                queries.append(q)
+        # Always retain the user's literal request as one search variant.
+        if request.casefold() not in seen:
             queries.insert(0, request[:100])
+
         try:
-            max_results = max(1, min(int(plan.get("max_results", 10)), 30))
+            max_results = max(1, int(plan.get("max_results", 10)))
         except Exception:
             max_results = 10
         return {
-            "queries": queries[:MAX_SEARCH_QUERIES],
+            "queries": queries,
             "max_results": max_results,
             "intent": str(plan.get("intent", request))[:500],
             "language_notes": str(plan.get("language_notes", ""))[:500],
@@ -100,7 +97,9 @@ async def _search_and_comments(queries):
             raise RuntimeError("checknow Telegram session не авторизована")
         entity = await client.get_entity(bot.TG_SOURCE_CHANNEL)
         posts = {}
-        per_query = max(10, min(MAX_RETRIEVED, 40))
+        # Query count is intentionally unlimited. Retrieval is still bounded so
+        # one huge search cannot exhaust memory or run forever.
+        per_query = 40
         for query in queries:
             try:
                 async for message in client.iter_messages(entity, search=query, limit=per_query):
@@ -110,8 +109,6 @@ async def _search_and_comments(queries):
             except Exception as e:
                 print(f"telegram search query '{query}': {e}", flush=True)
 
-        # Search discussion replies for every candidate. Telethon can expose
-        # replies to channel posts via reply_to; failures are intentionally non-fatal.
         comments = {}
         for mid, message in list(posts.items())[:MAX_RETRIEVED]:
             try:
@@ -130,7 +127,6 @@ async def _search_and_comments(queries):
 
 
 def _rank_hits(request, posts, comments):
-    """Use the LLM only for relevance/ranking, not for retrieval."""
     if not posts or not bot.LLM_API_KEY:
         return list(posts)
     chunks = []
@@ -138,17 +134,13 @@ def _rank_hits(request, posts, comments):
         text = (m.raw_text or "").strip()
         reply_text = "\n".join(comments.get(m.id, [])[:12])
         chunks.append({"id": m.id, "text": text[:2500], "comments": reply_text[:2500]})
-    prompt = f"""Оцени релевантность найденных Telegram-постов к запросу пользователя.
-Запрос пользователя: {request}
-
-Посты были реально найдены Telegram search. Не утверждай, что пост содержит то, чего нет в тексте.
-Комментарии тоже реальны и могут уточнять, исправлять или подтверждать пост.
-
+    prompt = f'''Оцени релевантность найденных Telegram-постов к запросу пользователя.
+Запрос: {request}
+Посты реально найдены через Telegram search. Комментарии тоже реальные.
 Верни СТРОГО JSON: {{"ranking":[{{"id":123,"relevance":0-100,"reason":"..."}}]}}
-Отсортируй от самых релевантных к наименее релевантным.
-
+Отсортируй от самых релевантных.
 КАНДИДАТЫ:
-{json.dumps(chunks, ensure_ascii=False)}"""
+{json.dumps(chunks, ensure_ascii=False)}'''
     try:
         plan = bot.call_model(bot.MODELS[0], prompt)
         ranking = plan.get("ranking", [])
@@ -163,10 +155,7 @@ def _search_context(message, comments, queries):
     text = (message.raw_text or "").strip()
     published = message.date.astimezone(timezone.utc).isoformat() if message.date else "неизвестно"
     replies = comments.get(message.id, [])
-    material = (
-        f"[Поисковый запрос пользователя]\n{queries[0] if queries else ''}\n"
-        f"[Дата публикации Telegram: {published}]\n{text}"
-    )
+    material = f"[Поисковый запрос пользователя]\n{queries[0] if queries else ''}\n[Дата публикации Telegram: {published}]\n{text}"
     if replies:
         material += "\n\n[КОММЕНТАРИИ / DISCUSSION]\n" + "\n---\n".join(replies[:MAX_COMMENTS_PER_POST])
     return material
@@ -190,8 +179,14 @@ async def enhanced_search_now(request, limit=30):
 
     plan = await asyncio.to_thread(plan_search, request)
     queries = plan["queries"]
+    # User result limit is separate from the number of search queries. If no
+    # explicit result limit is supplied, keep the existing default; search
+    # query generation itself is completely uncapped.
     requested_max = plan["max_results"]
-    hard_limit = max(1, min(int(limit), 30))
+    try:
+        hard_limit = max(1, int(limit))
+    except Exception:
+        hard_limit = requested_max
     requested_max = min(requested_max, hard_limit)
 
     bot.send_message(
@@ -199,7 +194,7 @@ async def enhanced_search_now(request, limit=30):
         f"🧠 Запрос: <code>{html.escape(request)}</code>\n"
         f"🎯 Цель: максимум <b>{requested_max}</b> результатов\n"
         f"🔎 Поисковых фраз: <b>{len(queries)}</b>\n"
-        "🌐 Ищу на русском + английском и по синонимам…"
+        "🌐 Ищу короткими ключевыми фразами и вариантами написания…"
     )
     bot.send_message("<b>Стратегия:</b>\n" + "\n".join(f"• {html.escape(q)}" for q in queries))
 
@@ -233,8 +228,6 @@ async def enhanced_search_now(request, limit=30):
                 settings["mode"],
             )
             score = int(result.get("score", 0))
-            # Search is semantic: don't apply the global hunter threshold here.
-            # The user asked for search results, so relevance/score is shown directly.
             results.append((score, message, result))
         except Exception as e:
             print(f"search analyze {message.id}: {e}", flush=True)
