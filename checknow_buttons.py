@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Compatibility patch for Telegram result buttons.
-Loads the existing checknow bot and fixes Deep Check / Verify callbacks
-without changing its existing menu/command implementation.
+"""Compatibility patch for Telegram result buttons and AI Search.
+Loads the existing checknow bot, fixes Deep Check / Verify callbacks, and
+replaces /search with an AI-planned Telegram search that also checks discussions.
 """
 import asyncio
 import html
@@ -11,6 +11,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 import checknow_bot as bot
+import search_engine
 
 _LOCK = threading.Lock()
 
@@ -121,6 +122,11 @@ def fixed_handle_callback(update):
 
 _original_handle_callback = bot.handle_callback
 bot.handle_callback = fixed_handle_callback
+
+# /search is handled by checknow_bot.main(), so monkey-patch the function it resolves.
+# The search engine itself uses Telegram search for retrieval; the LLM only expands
+# and ranks the query, then comments/discussions are added as analysis material.
+bot.search_now = search_engine.enhanced_search_now
 
 
 if __name__ == "__main__":
