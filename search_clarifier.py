@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI clarification + focused query planner for Telegram Search."""
+"""AI clarification + minimal entity-first query planner for Telegram Search."""
 import html
 import os
 import secrets
@@ -46,32 +46,53 @@ Return strict JSON only: {{"clarification_needed":true,"question":"...","options
 
 
 def plan_search(request):
-    """Generate broad but relevant 1-3 term queries. Never invent unrelated actions."""
+    """Generate entity-first queries. Do not manufacture modifiers or permutations."""
     if not bot.LLM_API_KEY:
         return {"queries": [request], "intent": request}
     langs = ", ".join(_LANG[x] for x in _languages())
     prompt = f'''You are a Telegram search-query planner.
 User request: {request}
 Allowed languages: {langs}. If Russian is not listed, NEVER output Russian.
-Create a broad set of SHORT search queries. Telegram runs each query separately.
 
-Rules:
-- First extract every explicit entity/topic the user actually named.
-- Always include each important entity alone and spelling variants. Example: tiktok, tik tok.
-- Add useful 2-3 term combinations only when they preserve the user's intent: tiktok api, tik tok api, tiktok username, tik tok username, tiktok abuse, tik tok abuse.
-- If the user explicitly asks for abuse, include abuse variants; do not silently replace that with generic hacking vocabulary.
-- NEVER invent spam, flood, attack, manipulation, injection, automation, vulnerability, exploit, bypass, hack, giveaway, etc. unless that concept is explicitly requested or is a direct synonym clearly present in the user's wording.
-- Do NOT make a Cartesian product. Do not produce permutations just to increase the count.
-- Do not translate the whole sentence. Use natural search terms used on the source.
-- For Chinese use real Chinese terms where appropriate (e.g. TikTok -> 抖音). Do not mix English modifiers into fake Chinese phrases.
-- Queries must be 1-3 words/terms. No sentences.
-- No artificial query-count limit: return as many genuinely useful distinct queries as needed.
-Return strict JSON: {{"queries":["tiktok","tik tok","tiktok api","tik tok api","tiktok username","tik tok username","tiktok abuse","tik tok abuse"],"intent":"..."}}'''
+Your job is NOT to paraphrase the request and NOT to invent search intents. Extract the concrete names/entities/topics the user wants searched.
+
+QUERY STRATEGY:
+1. For EVERY important named entity, ALWAYS output the entity ALONE first. Examples: stripe, cursor, tiktok, tik tok, python.
+2. Add spelling variants separately when they are genuinely used: tiktok and tik tok; Chinese equivalents such as 抖音 when appropriate.
+3. Then add only a SMALL number of directly useful combinations that the user's request clearly calls for. Examples: stripe python, cursor python, tiktok api, tik tok api, tiktok username, tik tok username, tiktok abuse, tik tok abuse.
+4. Keep the entity-alone queries. They are intentionally broad and are often more useful than long phrases.
+5. If the user asks for abuse, "abuse" may be used as a modifier. Do NOT automatically add exploit/hack/bypass/attack/vulnerability/spam/flood/manipulation/injection/automation/etc.
+6. NEVER create Cartesian products. Do not combine every entity with every modifier. Do not reverse words just to create more queries.
+7. Do not add "code", "script", "tutorial", "example", "github", "python", or similar to a query unless the user explicitly wants that concept for that entity. Python itself is an entity if the user named Python.
+8. Do not translate the user's whole sentence. Search using short natural terms likely to occur in posts.
+9. Chinese queries must be natural Chinese search terms, not English words glued to Chinese. Keep English brand names when they are commonly used that way.
+10. Each query must be 1-3 terms. One-term entity queries are REQUIRED.
+11. No artificial maximum query count. Return every genuinely useful entity/variant/combo, but do not pad the list.
+
+For the example request "find abuse stuff for cursor, stripe and tiktok username/api", a GOOD plan is roughly:
+stripe
+cursor
+python
+stripe python
+cursor python
+tiktok
+tik tok
+抖音
+tiktok api
+tik tok api
+tiktok username
+tik tok username
+tiktok abuse
+tik tok abuse
+
+A BAD plan contains dozens of combinations like "python cursor flood", "python cursor attack", "cursor manipulation", etc.
+Return strict JSON: {{"queries":[...],"intent":"..."}}'''
     data = _call(prompt, {"queries": [request], "intent": request})
     queries, seen = [], set()
     for raw in data.get("queries", []):
         q = str(raw).strip()
-        if not q or len(q) > 100 or len(q.split()) > 3: continue
+        if not q or len(q) > 80 or len(q.split()) > 3:
+            continue
         k = q.casefold()
         if k not in seen:
             seen.add(k); queries.append(q)
@@ -96,7 +117,6 @@ def start_or_search(request, original):
     request = request.strip()
     plan = clarify(request)
     if plan.get("clarification_needed") and _ask(request, plan, original):
-        bot.send_message("🧠 Поиск пока не запущен. После ответа ИИ заново построит поисковые фразы.")
         return
     return original(request)
 
