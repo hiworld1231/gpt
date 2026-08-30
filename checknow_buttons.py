@@ -185,13 +185,7 @@ def _multi_result(result, message, comments):
     return out
 
 
-search_engine._search_context = _multi_search_context
-search_engine._enhanced_search_result = _multi_result
-
-
 def _result_keyboard(source, message_id=None):
-    # Existing checknow_bot calls this with only message_id; those results always
-    # belong to the primary hunter channel. Search results pass source + message_id.
     if message_id is None:
         message_id = source
         source = bot.TG_SOURCE_CHANNEL
@@ -285,20 +279,33 @@ def _handle_source_command(raw):
 
 _original_get_updates = bot.get_updates
 
+
 def _get_updates_with_source(offset=None):
+    """Handle /source without re-delivering the same Telegram update.
+
+    IMPORTANT: bot.main() advances its polling offset from every update it
+    receives. The previous implementation consumed /source updates by
+    removing them from the returned list, so main() never advanced the offset
+    and Telegram returned the same /source message forever, causing spam.
+    We now keep the update and replace only its text after handling it; this
+    lets main() advance the offset exactly once while preventing the command
+    from being handled a second time.
+    """
     updates = _original_get_updates(offset)
-    keep = []
     for update in updates:
         message = update.get("message") or {}
         chat = message.get("chat") or {}
-        if str(chat.get("id")) == bot.CHAT_ID:
-            raw = (message.get("text") or "").strip()
-            command = raw.split()[0].lower() if raw else ""
-            if command in ("/source", "/sources"):
-                _handle_source_command(raw if command == "/source" else "/source list")
-                continue
-        keep.append(update)
-    return keep
+        if str(chat.get("id")) != bot.CHAT_ID:
+            continue
+        raw = (message.get("text") or "").strip()
+        command = raw.split()[0].lower() if raw else ""
+        if command in ("/source", "/sources"):
+            _handle_source_command(raw if command == "/source" else "/source list")
+            # Keep the update so main() advances offset, but make it inert.
+            # Do not delete it from the returned batch.
+            message["text"] = "/__source_handled__"
+    return updates
+
 
 bot.get_updates = _get_updates_with_source
 
