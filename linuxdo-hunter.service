@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux.do Hunter reliable realtime Telegram listener
+After=network-online.target linuxdo-hunter-llm-router.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/linuxdo-hunter
+EnvironmentFile=/etc/linuxdo-hunter.env
+ExecStart=/opt/linuxdo-hunter/.venv/bin/python /opt/linuxdo-hunter/linuxdo_hunter_rt.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
